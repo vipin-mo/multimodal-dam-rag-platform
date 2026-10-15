@@ -13,3 +13,12 @@ ENV/
 
 # OS Generated Files
 .DS_Store
+# Local secrets & generated data
+.env.*
+!.env.example
+samples/bench/
+samples/large/
+.coverage
+coverage.xml
+htmlcov/
+.ruff_cache/
