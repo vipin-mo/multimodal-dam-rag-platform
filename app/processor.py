@@ -1,354 +1,370 @@
-import os
-import cv2
-import uuid
-import boto3
+"""Celery ingestion worker: object storage -> parse/transcribe/sample -> embed -> Qdrant.
+
+One task per asset, addressed by asset id. Re-running a task is safe: existing vectors for the
+asset are deleted first and point ids are deterministic.
+"""
+
+import base64
+import contextlib
+import io
 import logging
-import requests
-from PIL import Image
+import os
+import shutil
+import tempfile
+import time
+from collections.abc import Callable, Iterable, Iterator
+from dataclasses import dataclass
+from itertools import islice
+
 from celery import Celery
-from pypdf import PdfReader
-from typing import Dict, Any
-from pydub import AudioSegment
-from qdrant_client import QdrantClient
-from faster_whisper import WhisperModel
-from qdrant_client.http import models as qmodels
-from sentence_transformers import SentenceTransformer
+from celery.signals import worker_process_init
+from qdrant_client.http import models as qm
 
-# System Logger Initialization
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("DAM-Worker")
+from app import config, embeddings, llm, media, storage, vectors
+from app.chunking import chunk_text, window_segments
+from app.database import Asset, SessionLocal, update_asset
 
-# Environment Infrastructure Configuration
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "amqp://guest:guest@rabbitmq:5672//")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis-cache:6379/0")
-MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "admin_vipin")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "admin_vipin")
-BUCKET_NAME = "dam-media"
-QDRANT_HOST = os.getenv("QDRANT_HOST", "vector-db")
-QDRANT_PORT = int(os.getenv("QDRANT_PORT", "6333"))
-API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://api-gateway:8000")
-SHARED_MEDIA_DIR = os.getenv("SHARED_MEDIA_DIR", "/app/shared-media")
+logger = logging.getLogger("dam.worker")
 
-os.makedirs(SHARED_MEDIA_DIR, exist_ok=True)
-
-# Celery Application Setup
-celery_app = Celery("dam_tasks", broker=CELERY_BROKER_URL, backend=CELERY_RESULT_BACKEND)
+celery_app = Celery("dam-worker", broker=config.celery_broker_url(), backend=config.CELERY_RESULT_BACKEND)
 celery_app.conf.update(
+    task_default_queue=config.INGESTION_QUEUE,
     task_track_started=True,
-    worker_prefetch_multiplier=1,
+    task_acks_late=True,  # a crashed worker's task is redelivered, not lost
+    task_reject_on_worker_lost=True,
+    worker_prefetch_multiplier=1,  # long tasks: don't let one child hoard the queue
     worker_max_tasks_per_child=50,
-    result_persistent=True
+    task_time_limit=3 * 3600,
+    result_expires=7 * 24 * 3600,
 )
 
-# Object Storage Client Initialization
-s3_client = boto3.client(
-    "s3",
-    endpoint_url=MINIO_ENDPOINT,
-    aws_access_key_id=MINIO_ACCESS_KEY,
-    aws_secret_access_key=MINIO_SECRET_KEY,
-    config=boto3.session.Config(signature_version="s3v4"),
-    region_name="us-east-1"
-)
 
-# Vector Database Client Initialization
-qdrant_client = QdrantClient(host=QDRANT_HOST, port=QDRANT_PORT)
+@worker_process_init.connect
+def _configure_threads(**_):
+    """Splits CPU threads between prefork children instead of each child using every core."""
+    threads = int(os.getenv("WORKER_THREADS", "0"))
+    if threads > 0:
+        import torch
 
-# Lazy-loaded Model Singletons
-_clip_model = None
-_whisper_model = None
-
-def get_clip_model():
-    """Initializes and caches the local CLIP model instance."""
-    global _clip_model
-    if _clip_model is None:
-        logger.info("Initializing worker-level CLIP model (clip-ViT-B-32)...")
-        _clip_model = SentenceTransformer("clip-ViT-B-32")
-    return _clip_model
-
-def get_whisper_model():
-    """Initializes and caches the Whisper audio transcription engine."""
-    global _whisper_model
-    if _whisper_model is None:
-        logger.info("Initializing worker-level Whisper engine (tiny, int8)...")
-        _whisper_model = WhisperModel("tiny", device="cpu", compute_type="int8")
-    return _whisper_model
+        torch.set_num_threads(threads)
 
 
-# --------------------------------------------------------------------
-# Celery Operational Core Processing Orchestrator
-# --------------------------------------------------------------------
+_whisper = None
 
-@celery_app.task(bind=True, name="app.processor.process_media_asset")
-def process_media_asset(self, filename: str) -> Dict[str, Any]:
-    """Ingests media assets from MinIO and routes them to type-specific processing pipelines."""
-    logger.info(f"Starting ingestion pipeline for file: {filename}")
-    self.update_state(state="PROGRESS", meta={"progress": 10})
 
-    local_path = os.path.join(SHARED_MEDIA_DIR, filename)
+def whisper_model():
+    global _whisper
+    if _whisper is None:
+        from faster_whisper import WhisperModel
+
+        logger.info("Loading Whisper %s (%s)", config.WHISPER_MODEL_SIZE, config.WHISPER_COMPUTE_TYPE)
+        _whisper = WhisperModel(
+            config.WHISPER_MODEL_SIZE,
+            device="cpu",
+            compute_type=config.WHISPER_COMPUTE_TYPE,
+            cpu_threads=int(os.getenv("WORKER_THREADS", "0")),
+        )
+    return _whisper
+
+
+@dataclass
+class Job:
+    asset_id: str
+    filename: str
+    media_type: str
+    path: str
+    report: Callable[[int, str], None]
+
+    def payload(self, **extra) -> dict:
+        return {"asset_id": self.asset_id, "filename": self.filename, "media_type": self.media_type, **extra}
+
+
+def batched(items: Iterable, size: int) -> Iterator[list]:
+    it = iter(items)
+    while batch := list(islice(it, size)):
+        yield batch
+
+
+# ====================================================================== task
+@celery_app.task(bind=True, name="dam.ingest_asset")
+def ingest_asset(self, asset_id: str) -> dict:
+    with SessionLocal() as db:
+        asset = db.get(Asset, asset_id)
+        if asset is None:
+            return {"skipped": "asset no longer exists"}
+        filename, key, media_type = asset.filename, asset.object_key, asset.media_type
+
+    def report(progress: int, stage: str) -> None:
+        self.update_state(state="PROGRESS", meta={"progress": progress, "stage": stage})
+
+    update_asset(asset_id, status="processing", error=None, task_id=self.request.id)
+    os.makedirs(config.WORK_DIR, exist_ok=True)
+    workdir = tempfile.mkdtemp(prefix="ingest-", dir=config.WORK_DIR)
+    started = time.perf_counter()
     try:
-        s3_client.download_file(BUCKET_NAME, filename, local_path)
-        self.update_state(state="PROGRESS", meta={"progress": 25})
+        report(2, "downloading")
+        ext = media.extension(filename)
+        # Local path derives from the asset id only; the user-supplied name never touches the filesystem.
+        local_path = os.path.join(workdir, f"source{ext}")
+        storage.download(key, local_path)
+        with open(local_path, "rb") as fh:
+            if not media.sniff_ok(ext, fh.read(64)):
+                raise media.UnsupportedMediaError("File content does not match its extension.")
 
-        _, ext = os.path.splitext(filename)
-        ext = ext.lower()
+        vectors.delete_asset(asset_id)  # idempotent re-indexing
+        job = Job(asset_id, filename, media_type, local_path, report)
+        stats = PIPELINES[media_type](job)
+        stats["processing_seconds"] = round(time.perf_counter() - started, 2)
 
-        if ext == ".pdf":
-            result = process_pdf(self, filename, local_path)
-        elif ext in [".png", ".jpg", ".jpeg"]:
-            result = process_static_image(self, filename, local_path)
-        elif ext in [".mp4", ".avi", ".mov", ".mkv", ".mp3", ".wav"]:
-            result = process_multimedia(self, filename, local_path)
-        else:
-            raise ValueError(f"Unsupported file extension: {ext}")
+        with SessionLocal() as db:
+            still_exists = db.get(Asset, asset_id) is not None
+        if not still_exists:  # deleted while processing: drop what we just wrote
+            vectors.delete_asset(asset_id)
+            return {"skipped": "asset deleted during processing"}
 
-        self.update_state(state="SUCCESS", meta={"progress": 100})
-        return result
-
-    except Exception as e:
-        logger.error(f"Pipeline processing failed for asset '{filename}': {str(e)}")
-        self.update_state(state="FAILURE", meta={"error": str(e)})
-        raise e
+        caption = stats.pop("caption", None)
+        update_asset(
+            asset_id,
+            status="ready",
+            stats=stats,
+            caption=caption,
+            duration_seconds=stats.get("duration_seconds"),
+            summary=None,
+        )
+        logger.info("Ingested %s (%s) in %.1fs: %s", filename, media_type, stats["processing_seconds"], stats)
+        return stats
+    except Exception as exc:
+        logger.exception("Ingestion failed for %s", asset_id)
+        with contextlib.suppress(LookupError):  # asset deleted mid-task
+            update_asset(asset_id, status="failed", error=f"{type(exc).__name__}: {exc}"[:1000])
+        raise
     finally:
-        if os.path.exists(local_path):
-            os.remove(local_path)
-            logger.info(f"Temporary file cleared: {local_path}")
+        shutil.rmtree(workdir, ignore_errors=True)
 
 
-# --------------------------------------------------------------------
-# Structural File Domain Parsers
-# --------------------------------------------------------------------
+# ====================================================================== documents
+def process_document(job: Job) -> dict:
+    from pypdf import PdfReader
 
-def process_pdf(task, filename: str, path: str) -> Dict[str, Any]:
-    """Extracts text content from PDF pages and vectorizes chunks for search indexing."""
-    logger.info(f"Parsing document text layout maps for target: {filename}")
-    reader = PdfReader(path)
+    reader = PdfReader(job.path)
     total_pages = len(reader.pages)
-    points = []
+    chunks: list[tuple[int, str]] = []
+    empty_pages = 0
+    for page_no, page in enumerate(reader.pages, start=1):
+        page_chunks = chunk_text(page.extract_text() or "", config.CHUNK_SIZE_CHARS, config.CHUNK_OVERLAP_CHARS)
+        empty_pages += not page_chunks
+        chunks.extend((page_no, c) for c in page_chunks)
+        if page_no % 10 == 0:
+            job.report(5 + int(35 * page_no / total_pages), "extracting text")
 
-    for idx, page in enumerate(reader.pages):
-        raw_text = page.extract_text()
-        if not raw_text or not raw_text.strip():
-            continue
-
-        paragraphs = [p.strip() for p in raw_text.split("\n") if len(p.strip()) > 20]
-
-        for paragraph in paragraphs:
-            try:
-                response = requests.post(
-                    f"{API_GATEWAY_URL}/api/internal/embed",
-                    json={"text": paragraph},
-                    timeout=15
+    indexed = 0
+    for batch in batched(enumerate(chunks), config.UPSERT_BATCH_SIZE):
+        embedded = embeddings.embed_texts([text for _, (_, text) in batch])
+        vectors.qdrant.upsert(
+            vectors.TEXT,
+            points=[
+                qm.PointStruct(
+                    id=vectors.point_id(job.asset_id, "chunk", i),
+                    vector=vec,
+                    payload=job.payload(kind="chunk", text=text, page=page),
                 )
-                if response.status_code == 200:
-                    text_vector = response.json()["vector"]
-                else:
-                    logger.error(f"Embedding API returned status code: {response.status_code}")
-                    continue
-            except Exception as embed_err:
-                logger.error(f"Internal embedding network connection failed: {str(embed_err)}")
-                continue
+                for (i, (page, text)), vec in zip(batch, embedded, strict=True)
+            ],
+            wait=True,
+        )
+        indexed += len(batch)
+        job.report(40 + int(55 * indexed / max(1, len(chunks))), "embedding")
 
-            points.append(
-                qmodels.PointStruct(
-                    id=str(uuid.uuid4()),
-                    vector=text_vector,
-                    payload={
-                        "filename": filename,
-                        "text": paragraph,
-                        "timestamp": float(idx + 1),
-                        "type": "document"
-                    }
-                )
-            )
-
-        progress_weight = 25 + int((idx / total_pages) * 65)
-        task.update_state(state="PROGRESS", meta={"progress": progress_weight})
-
-    if points:
-        qdrant_client.upsert(collection_name="text_chunks", points=points)
-
-    return {"processed_type": "PDF_DOCUMENT", "chunks_indexed": len(points)}
+    # Pages with no text layer (scans) need OCR, which this pipeline does not do.
+    return {"pages": total_pages, "chunks_indexed": indexed, "pages_without_text": empty_pages}
 
 
-def process_static_image(task, filename: str, path: str) -> Dict[str, Any]:
-    """Calculates CLIP visual feature vectors for flat image matrices and indexes them,
-    while also generating text embeddings for keyword search cross-compatibility."""
-    logger.info(f"Computing visual vectors for image target: {filename}")
+# ====================================================================== images
+def _jpeg_b64(image, max_side: int = 1024) -> str:
+    preview = image.copy()
+    preview.thumbnail((max_side, max_side))
+    buf = io.BytesIO()
+    preview.save(buf, format="JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
 
-    img = cv2.imread(path)
-    if img is None:
-        raise ValueError("Image matrix data is unreadable or corrupted.")
 
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    pil_img = Image.fromarray(img_rgb)
+def caption_image(image) -> str | None:
+    """Short VLM description, indexed as text so images are reachable from text search and RAG."""
+    try:
+        return llm.chat_sync(
+            "You describe images for a search index.",
+            llm.CAPTION_PROMPT,
+            model=config.OLLAMA_VISION_MODEL,
+            images=[_jpeg_b64(image)],
+            max_tokens=160,
+        )
+    except Exception as exc:  # noqa: BLE001 - captions are best-effort
+        logger.warning("Captioning skipped: %s", exc)
+        return None
 
-    # 1. Index visual features into CLIP collection
-    clip_engine = get_clip_model()
-    image_vector = clip_engine.encode(pil_img).tolist()
 
-    task.update_state(state="PROGRESS", meta={"progress": 60})
+def process_image(job: Job) -> dict:
+    from PIL import Image, ImageOps
 
-    qdrant_client.upsert(
-        collection_name="image_features",
+    with Image.open(job.path) as raw:
+        image = ImageOps.exif_transpose(raw).convert("RGB")
+    width, height = image.size
+    job.report(20, "embedding image")
+    vector = embeddings.embed_images([image])[0]
+    vectors.qdrant.upsert(
+        vectors.IMAGE,
         points=[
-            qmodels.PointStruct(
-                id=str(uuid.uuid4()),
-                vector=image_vector,
-                payload={
-                    "filename": filename,
-                    "timestamp": 0.0,
-                    "type": "image",
-                },
+            qm.PointStruct(
+                id=vectors.point_id(job.asset_id, "image", 0), vector=vector, payload=job.payload(kind="image")
             )
         ],
+        wait=True,
     )
 
-    # 2. Index filename/metadata text into text_chunks collection via gateway embedding endpoint
-    task.update_state(state="PROGRESS", meta={"progress": 85})
-    text_content = f"Uploaded image asset: {filename}. Visual digital graphic or poster resource."
-
-    try:
-        embed_res = requests.post(
-            f"{API_GATEWAY_URL}/api/internal/embed",
-            json={"text": text_content},
-            timeout=10
+    caption = None
+    if config.CAPTION_IMAGES:
+        job.report(50, "captioning")
+        caption = caption_image(image)
+    if caption:
+        vectors.qdrant.upsert(
+            vectors.TEXT,
+            points=[
+                qm.PointStruct(
+                    id=vectors.point_id(job.asset_id, "caption", 0),
+                    vector=embeddings.embed_texts([caption])[0],
+                    payload=job.payload(kind="caption", text=caption),
+                )
+            ],
+            wait=True,
         )
-        if embed_res.status_code == 200:
-            text_vector = embed_res.json()["vector"]
-            qdrant_client.upsert(
-                collection_name="text_chunks",
-                points=[
-                    qmodels.PointStruct(
-                        id=str(uuid.uuid4()),
-                        vector=text_vector,
-                        payload={
-                            "filename": filename,
-                            "text": text_content,
-                            "timestamp": 0.0,
-                            "type": "image_metadata"
-                        }
-                    )
-                ]
-            )
-    except Exception as e:
-        logger.warning(f"Failed to push image metadata text vector: {str(e)}")
-
-    return {"processed_type": "STATIC_IMAGE", "chunks_indexed": 2}
+    return {"width": width, "height": height, "image_vectors": 1, "captioned": bool(caption), "caption": caption}
 
 
-def process_multimedia(task, filename: str, path: str) -> Dict[str, Any]:
-    """Unified pipeline for processing sequential video frames and speech-to-text streams."""
-    logger.info(f"Analyzing multimedia streams for target asset: {filename}")
+# ====================================================================== audio / video
+def probe(path: str) -> tuple[float | None, bool]:
+    """(duration in seconds, has an audio stream) via PyAV."""
+    import av
 
-    _, ext = os.path.splitext(filename)
-    ext = ext.lower()
+    with av.open(path) as container:
+        duration = container.duration / 1_000_000 if container.duration else None
+        return duration, bool(container.streams.audio)
 
-    audio_path = os.path.join(SHARED_MEDIA_DIR, f"{uuid.uuid4()}.mp3")
-    has_video = ext in [".mp4", ".avi", ".mov", ".mkv"]
-    has_audio = True
 
-    video_points = []
-    audio_points = []
+def sample_frames(job: Job, duration: float | None, progress_span: tuple[int, int]) -> int:
+    """Embeds one frame every FRAME_SAMPLE_SECONDS. Frames in between are grab()-ed, which skips
+    the colour conversion and copy, and sampled frames are downscaled before batching."""
+    import cv2
+    from PIL import Image
 
-    # --- 1. Downsampled Frame Matrix Processing Loop ---
-    if has_video:
-        logger.info("Extracting sample frames from video file matrix...")
-        video = cv2.VideoCapture(path)
-        fps = video.get(cv2.CAP_PROP_FPS) or 25.0
-        frame_interval = int(fps * 2)
+    capture = cv2.VideoCapture(job.path)
+    fps = capture.get(cv2.CAP_PROP_FPS)
+    fps = fps if 0 < fps <= 240 else 25.0
+    step = max(1, round(fps * config.FRAME_SAMPLE_SECONDS))
+    lo, hi = progress_span
+    images: list = []
+    stamps: list[float] = []
+    indexed = 0
 
-        clip_engine = get_clip_model()
-        frame_count = 0
+    def flush() -> None:
+        nonlocal indexed
+        if not images:
+            return
+        embedded = embeddings.embed_images(images)
+        vectors.qdrant.upsert(
+            vectors.IMAGE,
+            points=[
+                qm.PointStruct(
+                    id=vectors.point_id(job.asset_id, "frame", indexed + i),
+                    vector=vec,
+                    payload=job.payload(kind="video_frame", start=ts, end=ts + config.FRAME_SAMPLE_SECONDS),
+                )
+                for i, (ts, vec) in enumerate(zip(stamps, embedded, strict=True))
+            ],
+            wait=True,
+        )
+        indexed += len(images)
+        if duration:
+            job.report(lo + int((hi - lo) * min(1.0, stamps[-1] / duration)), "sampling frames")
+        images.clear()
+        stamps.clear()
 
-        try:
-            while True:
-                ret, frame = video.read()
-                if not ret:
-                    break
-
-                if frame_count % frame_interval == 0:
-                    current_ts = float(frame_count / fps)
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                    pil_img = Image.fromarray(frame_rgb)
-                    feat_vector = clip_engine.encode(pil_img).tolist()
-
-                    video_points.append(
-                        qmodels.PointStruct(
-                            id=str(uuid.uuid4()),
-                            vector=feat_vector,
-                            payload={
-                                "filename": filename,
-                                "timestamp": current_ts,
-                                "type": "video_frame",
-                            },
-                        )
-                    )
-                frame_count += 1
-        finally:
-            video.release()
-
-        task.update_state(state="PROGRESS", meta={"progress": 60})
-
-    # --- 2. Isolation and Processing of Audio Streams ---
-    logger.info("Extracting audio channels to MP3 format...")
     try:
-        track = AudioSegment.from_file(path)
-        track.export(audio_path, format="mp3")
-    except Exception as audio_err:
-        logger.warning(f"Audio channel extraction skipped or unavailable: {str(audio_err)}")
-        has_audio = False
+        frame_index = 0
+        while True:
+            if frame_index % step == 0:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                image.thumbnail((448, 448))  # CLIP sees 224x224; keep batches small in memory
+                images.append(image)
+                stamps.append(frame_index / fps)
+                if len(images) >= config.EMBED_BATCH_SIZE:
+                    flush()
+            elif not capture.grab():
+                break
+            frame_index += 1
+        flush()
+    finally:
+        capture.release()
+    return indexed
 
-    if has_audio and os.path.exists(audio_path):
-        try:
-            whisper_engine = get_whisper_model()
-            segments_gen, _ = whisper_engine.transcribe(audio_path, beam_size=1)
-            segments = list(segments_gen)
 
-            for segment in segments:
-                text_chunk = segment.text.strip()
-                if not text_chunk:
-                    continue
+def transcribe(job: Job, duration: float | None, progress_span: tuple[int, int]) -> tuple[int, str | None]:
+    """faster-whisper decodes the audio track straight from the file (PyAV), with VAD to skip silence."""
+    lo, hi = progress_span
+    segments_iter, info = whisper_model().transcribe(job.path, beam_size=1, vad_filter=True)
+    segments = []
+    for segment in segments_iter:
+        segments.append(segment)
+        if duration and len(segments) % 10 == 0:
+            job.report(lo + int((hi - lo) * min(1.0, segment.end / duration)), "transcribing")
 
-                try:
-                    embed_res = requests.post(
-                        f"{API_GATEWAY_URL}/api/internal/embed",
-                        json={"text": text_chunk},
-                        timeout=10
-                    )
-                    if embed_res.status_code == 200:
-                        text_vector = embed_res.json()["vector"]
-                        audio_points.append(
-                            qmodels.PointStruct(
-                                id=str(uuid.uuid4()),
-                                vector=text_vector,
-                                payload={
-                                    "filename": filename,
-                                    "text": text_chunk,
-                                    "timestamp": float(segment.start),
-                                    "type": "audio_transcript"
-                                }
-                            )
-                        )
-                    else:
-                        logger.error(f"Gateway embedding failure status: {embed_res.status_code}")
-                except Exception as embed_err:
-                    logger.error(f"Failed internal text transcription embedding offload: {str(embed_err)}")
-                    continue
-        finally:
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
+    windows = window_segments(segments, config.CHUNK_SIZE_CHARS)
+    for offset, batch in enumerate(batched(windows, config.UPSERT_BATCH_SIZE)):
+        embedded = embeddings.embed_texts([w.text for w in batch])
+        base = offset * config.UPSERT_BATCH_SIZE
+        vectors.qdrant.upsert(
+            vectors.TEXT,
+            points=[
+                qm.PointStruct(
+                    id=vectors.point_id(job.asset_id, "transcript", base + i),
+                    vector=vec,
+                    payload=job.payload(kind="transcript", text=w.text, start=w.start, end=w.end),
+                )
+                for i, (w, vec) in enumerate(zip(batch, embedded, strict=True))
+            ],
+            wait=True,
+        )
+    return len(windows), getattr(info, "language", None)
 
-    task.update_state(state="PROGRESS", meta={"progress": 90})
 
-    # --- 3. Synchronous Mass Index Upserting ---
-    if video_points:
-        qdrant_client.upsert(collection_name="image_features", points=video_points)
-    if audio_points:
-        qdrant_client.upsert(collection_name="text_chunks", points=audio_points)
-
+def process_video(job: Job) -> dict:
+    duration, has_audio = probe(job.path)
+    frames = sample_frames(job, duration, (5, 50 if has_audio else 95))
+    windows, language = transcribe(job, duration, (50, 95)) if has_audio else (0, None)
     return {
-        "processed_type": "MULTIMEDIA_STREAM",
-        "visual_frames_indexed": len(video_points),
-        "transcript_segments_indexed": len(audio_points),
+        "duration_seconds": round(duration, 2) if duration else None,
+        "frames_indexed": frames,
+        "transcript_windows": windows,
+        "language": language,
+        "has_audio": has_audio,
     }
+
+
+def process_audio(job: Job) -> dict:
+    duration, _ = probe(job.path)
+    windows, language = transcribe(job, duration, (5, 95))
+    return {
+        "duration_seconds": round(duration, 2) if duration else None,
+        "transcript_windows": windows,
+        "language": language,
+    }
+
+
+PIPELINES: dict[str, Callable[[Job], dict]] = {
+    "document": process_document,
+    "image": process_image,
+    "video": process_video,
+    "audio": process_audio,
+}
