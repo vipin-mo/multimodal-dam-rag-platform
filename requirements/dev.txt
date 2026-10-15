@@ -1,0 +1,8 @@
+-r api.txt
+-r worker.txt
+-r ui.txt
+torch==2.14.0
+pytest==8.0.2
+pytest-cov==5.0.0
+ruff==0.6.9
+fpdf2==2.7.9

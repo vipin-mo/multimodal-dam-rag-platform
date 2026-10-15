@@ -1,195 +1,220 @@
+# Multimodal DAM: 9 long-running services + 1 one-shot model puller.
+#   docker compose up -d --build                         # core stack
+#   docker compose --profile monitoring up -d            # + Prometheus & Grafana
+# Secrets come from .env (create it with ./scripts/init-env.sh); compose refuses to start without them.
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://dam:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres-db:5432/dam
+  MINIO_ENDPOINT: http://minio:9000
+  MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}
+  MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+  MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+  MINIO_BUCKET: ${MINIO_BUCKET:-dam-media}
+  QDRANT_HOST: vector-db
+  QDRANT_PORT: "6333"
+  CELERY_BROKER_URL: amqp://${RABBITMQ_USER:?set RABBITMQ_USER in .env}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@rabbitmq:5672//
+  CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis-cache:6379/0
+  OLLAMA_HOST: http://ollama-engine:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:1.5b}
+  OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-llava:7b}
+  CHUNK_SIZE_CHARS: ${CHUNK_SIZE_CHARS:-500}
+  CHUNK_OVERLAP_CHARS: ${CHUNK_OVERLAP_CHARS:-100}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+  HF_HOME: /models/hf
+
+x-healthy: &healthy
+  condition: service_healthy
+
 networks:
   dam-network:
-    name: dam-network
-    driver: bridge
 
 volumes:
   qdrant_storage:
-  ollama_storage:
   postgres_data:
   minio_data:
-  shared_media:
+  ollama_storage:
+  hf_cache:
+  worker_tmp:
+  prometheus_data:
+  grafana_data:
 
 services:
-  # --------------------------------------------------------------------
-  # Core Infrastructure & Database Engines
-  # --------------------------------------------------------------------
+  # ------------------------------------------------------------------ data & messaging
   vector-db:
     image: qdrant/qdrant:v1.8.0
-    container_name: dam-vector-db
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - qdrant_storage:/qdrant/storage
-    networks:
-      - dam-network
+    ports: ["127.0.0.1:6333:6333"]  # dashboard at http://localhost:6333/dashboard
+    volumes: [qdrant_storage:/qdrant/storage]
+    networks: [dam-network]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
   postgres-db:
-    image: postgres:15-alpine
-    container_name: dam-postgres-db
-    ports:
-      - "5432:5432"
+    image: postgres:15.10-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: dam_db
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - dam-network
+      POSTGRES_USER: dam
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: dam
+    volumes: [postgres_data:/var/lib/postgresql/data]
+    networks: [dam-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dam -d dam"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
-  redis-cache:
-    image: redis:7-alpine
-    container_name: dam-redis-cache
-    ports:
-      - "6379:6379"
-    networks:
-      - dam-network
-    restart: unless-stopped
-
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: dam-rabbitmq
-    ports:
-      - "5672:5672"
-      - "15672:15672"
+  redis-cache:  # Celery result backend (task state & progress)
+    image: redis:7.2.5-alpine
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --maxmemory 256mb --maxmemory-policy allkeys-lru"]
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
-    networks:
-      - dam-network
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}
+    networks: [dam-network]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:latest
-    container_name: dam-minio
-    ports:
-      - "9000:9000"
-      - "9001:9001"
+  rabbitmq:  # Celery broker (ingestion queue)
+    image: rabbitmq:3.13.7-management-alpine
     environment:
-      MINIO_ROOT_USER: admin_vipin
-      MINIO_ROOT_PASSWORD: admin_vipin
-      MINIO_BROWSER_REDIRECT_URL: http://localhost:9000
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-    networks:
-      - dam-network
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:?set RABBITMQ_USER in .env}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}
+    ports: ["127.0.0.1:15672:15672"]  # management UI
+    networks: [dam-network]
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
     restart: unless-stopped
 
-  # --------------------------------------------------------------------
-  # Artificial Intelligence & Local LLM Runtimes
-  # --------------------------------------------------------------------
+  minio:  # S3-compatible object storage. The minio/minio Docker Hub repo is gone; Chainguard builds from source.
+    image: cgr.dev/chainguard/minio@sha256:2136d593beacf4461187035eca949fe49abd589d5079735025c711ca58fee0c8
+    command: ["server", "/data", "--console-address", ":9001"]
+    user: "0"  # named volume is root-owned on first mount
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    ports:
+      - "${DAM_BIND:-127.0.0.1}:9000:9000"  # browsers/CLI use presigned URLs against this port
+      - "127.0.0.1:9001:9001"               # console
+    volumes: [minio_data:/data]
+    networks: [dam-network]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ local LLM / VLM
   ollama-engine:
-    image: ollama/ollama:latest
-    container_name: dam-ollama-engine
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_storage:/root/.ollama
-    networks:
-      - dam-network
+    image: ollama/ollama:0.34.0
+    environment:
+      OLLAMA_KEEP_ALIVE: 10m
+      OLLAMA_MAX_LOADED_MODELS: "1"  # swap text/vision models instead of holding both in RAM
+    volumes: [ollama_storage:/root/.ollama]
+    networks: [dam-network]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
     restart: unless-stopped
 
-  ollama-initializer:
-    image: alpine:latest
-    container_name: dam-ollama-initializer
+  ollama-init:  # one-shot: pulls the models, then exits
+    image: ollama/ollama:0.34.0
     depends_on:
-      - ollama-engine
-    networks:
-      - dam-network
-    entrypoint: [ "/bin/sh", "-c" ]
-    command: >
-      apk add --no-cache curl &&
-      echo 'Waiting for Ollama Engine to fully boot...' &&
-      until curl -s http://ollama-engine:11434/api/tags > /dev/null; do sleep 3; done &&
-      echo 'Pulling model qwen2.5:1.5b...' &&
-      curl -X POST http://ollama-engine:11434/api/pull -d '{"name": "qwen2.5:1.5b", "stream": false}' &&
-      echo 'Pulling vision model llava...' &&
-      curl -X POST http://ollama-engine:11434/api/pull -d '{"name": "llava", "stream": false}' &&
-      echo 'Model initialization sequence completed successfully.'
+      ollama-engine: *healthy
+    environment:
+      OLLAMA_HOST: http://ollama-engine:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["ollama pull ${OLLAMA_MODEL:-qwen2.5:1.5b} && ollama pull ${OLLAMA_VISION_MODEL:-llava:7b}"]
+    networks: [dam-network]
+    restart: "no"
 
-  # --------------------------------------------------------------------
-  # Application Services Layer
-  # --------------------------------------------------------------------
+  # ------------------------------------------------------------------ application
   api-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dam-api-gateway
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
-    ports:
-      - "8000:8000"
+    build: {context: ., target: api}
+    image: dam-api:${DAM_VERSION:-dev}
     environment:
-      - DATABASE_URL=postgresql://postgres:postgres@postgres-db:5432/dam_db
-      - MINIO_ENDPOINT=http://minio:9000
-      - MINIO_ACCESS_KEY=admin_vipin
-      - MINIO_SECRET_KEY=admin_vipin
-      - QDRANT_HOST=vector-db
-      - QDRANT_PORT=6333
-      - OLLAMA_URL=http://ollama-engine:11434/v1/chat/completions
-      - OLLAMA_MODEL=qwen2.5:1.5b
-      - OLLAMA_VISION_MODEL=llava
-      - OLLAMA_HOST=http://ollama-engine:11434
-      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
-      - CELERY_RESULT_BACKEND=redis://redis-cache:6379/0
-      - JWT_SECRET=super-secret-enterprise-dam-signing-key-2026
-      - SHARED_MEDIA_DIR=/app/shared-media
-    volumes:
-      - shared_media:/app/shared-media
+      <<: *app-env
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      VIEWER_USERNAME: ${VIEWER_USERNAME:-viewer}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8501}
+      MAX_DIRECT_UPLOAD_MB: ${MAX_DIRECT_UPLOAD_MB:-5120}
+    ports: ["${DAM_BIND:-127.0.0.1}:8000:8000"]
+    volumes: [hf_cache:/models/hf]
     depends_on:
-      - postgres-db
-      - vector-db
-      - minio
-      - rabbitmq
-      - redis-cache
-    networks:
-      - dam-network
+      postgres-db: *healthy
+      vector-db: *healthy
+      minio: *healthy
+      rabbitmq: *healthy
+      redis-cache: *healthy
+    networks: [dam-network]
     restart: unless-stopped
 
-  ingestion-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dam-ingestion-worker
-    command: celery -A app.processor.celery_app worker --loglevel=info --concurrency=2
+  ingestion-worker:
+    build: {context: ., target: worker}
+    image: dam-worker:${DAM_VERSION:-dev}
     environment:
-      - MINIO_ENDPOINT=http://minio:9000
-      - MINIO_ACCESS_KEY=admin_vipin
-      - MINIO_SECRET_KEY=admin_vipin
-      - QDRANT_HOST=vector-db
-      - QDRANT_PORT=6333
-      - CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
-      - CELERY_RESULT_BACKEND=redis://redis-cache:6379/0
-      - API_GATEWAY_URL=http://api-gateway:8000
-      - OMP_NUM_THREADS=1
-      - SHARED_MEDIA_DIR=/app/shared-media
+      <<: *app-env
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      WORKER_THREADS: ${WORKER_THREADS:-4}  # torch/whisper threads per child process
+      WHISPER_MODEL_SIZE: ${WHISPER_MODEL_SIZE:-tiny}
+      FRAME_SAMPLE_SECONDS: ${FRAME_SAMPLE_SECONDS:-2}
+      CAPTION_IMAGES: ${CAPTION_IMAGES:-true}
     volumes:
-      - shared_media:/app/shared-media
+      - hf_cache:/models/hf
+      - worker_tmp:/work
     depends_on:
-      - rabbitmq
-      - redis-cache
-      - vector-db
-      - minio
-    networks:
-      - dam-network
+      api-gateway: *healthy  # gateway creates tables, bucket and collections on startup
+    networks: [dam-network]
     restart: unless-stopped
 
   frontend-ui:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: dam-frontend-ui
-    command: streamlit run app/app.py --server.port 8501 --server.address 0.0.0.0 --server.fileWatcherType poll
-    ports:
-      - "8501:8501"
+    build: {context: ., target: ui}
+    image: dam-ui:${DAM_VERSION:-dev}
     environment:
-      - API_GATEWAY_URL=http://api-gateway:8000
+      API_GATEWAY_URL: http://api-gateway:8000
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-200}
+    ports: ["${DAM_BIND:-127.0.0.1}:8501:8501"]
     depends_on:
-      - api-gateway
-    networks:
-      - dam-network
+      api-gateway: *healthy
+    networks: [dam-network]
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------ monitoring (opt-in)
+  prometheus:
+    profiles: [monitoring]
+    image: prom/prometheus:v2.53.2
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    ports: ["127.0.0.1:9090:9090"]
+    networks: [dam-network]
+    restart: unless-stopped
+
+  grafana:
+    profiles: [monitoring]
+    image: grafana/grafana:11.2.2
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on: [prometheus]
+    networks: [dam-network]
     restart: unless-stopped

@@ -1,0 +1,5 @@
+-r common.txt
+faster-whisper==1.1.0
+av==18.1.0
+opencv-python-headless==4.9.0.80
+pypdf==4.2.0
