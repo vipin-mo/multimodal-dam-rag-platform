@@ -160,8 +160,19 @@ def speech_file(sentences: list[str], out: Path, workdir: Path) -> None:
     silence = workdir / "silence.wav"
     if not silence.exists():
         subprocess.run(
-            ["ffmpeg", "-y", "-loglevel", "error", "-f", "lavfi", "-i", "anullsrc=r=16000:cl=mono",
-             "-t", "0.8", str(silence)],
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=16000:cl=mono",
+                "-t",
+                "0.8",
+                str(silence),
+            ],
             check=True,
         )
     listing.write_text("".join(f"file '{p}'\nfile '{silence}'\n" for p in parts))
@@ -174,7 +185,9 @@ def speech_file(sentences: list[str], out: Path, workdir: Path) -> None:
 def media_duration(path: Path) -> float:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     )
     return float(out.stdout.strip())
 
@@ -193,9 +206,28 @@ def make_video(out: Path, workdir: Path) -> None:
     lines.append(f"file '{workdir / f'scene_{len(scenes) - 1}.png'}'\n")
     listing.write_text("".join(lines))
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(listing),
-         "-i", str(narration), "-vf", "fps=25,format=yuv420p", "-c:v", "libx264", "-c:a", "aac",
-         "-shortest", str(out)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(listing),
+            "-i",
+            str(narration),
+            "-vf",
+            "fps=25,format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            "-shortest",
+            str(out),
+        ],
         check=True,
     )
 
@@ -203,12 +235,37 @@ def make_video(out: Path, workdir: Path) -> None:
 def make_large_video(out: Path, seconds: int = 180) -> None:
     """~1 GB incompressible 1080p video (noise caps the encoder at the target bitrate)."""
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error",
-         "-f", "lavfi", "-i", f"testsrc2=size=1920x1080:rate=30:duration={seconds}",
-         "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
-         "-vf", "noise=alls=60:allf=t", "-c:v", "libx264", "-preset", "ultrafast",
-         "-b:v", "45M", "-minrate", "45M", "-maxrate", "45M", "-bufsize", "90M",
-         "-c:a", "aac", str(out)],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=1920x1080:rate=30:duration={seconds}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={seconds}",
+            "-vf",
+            "noise=alls=60:allf=t",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-b:v",
+            "45M",
+            "-minrate",
+            "45M",
+            "-maxrate",
+            "45M",
+            "-bufsize",
+            "90M",
+            "-c:a",
+            "aac",
+            str(out),
+        ],
         check=True,
     )
 
@@ -216,15 +273,36 @@ def make_large_video(out: Path, seconds: int = 180) -> None:
 def filler_sentences(n: int, seed: int) -> list[str]:
     """Deterministic business-prose filler for size benchmarks."""
     rng = random.Random(seed)
-    subjects = ["The operations team", "Our finance group", "The platform squad", "Regional managers",
-                "The support desk", "Warehouse staff", "The security council", "Product marketing"]
+    subjects = [
+        "The operations team",
+        "Our finance group",
+        "The platform squad",
+        "Regional managers",
+        "The support desk",
+        "Warehouse staff",
+        "The security council",
+        "Product marketing",
+    ]
     verbs = ["reviewed", "approved", "postponed", "documented", "escalated", "measured", "simplified"]
-    objects = ["the quarterly forecast", "the onboarding checklist", "vendor contracts", "incident runbooks",
-               "shipping latency", "the hiring plan", "capacity targets", "the training budget"]
-    tails = ["after the steering meeting.", "ahead of the audit.", "for the northern region.",
-             "with input from customers.", "before the holiday freeze.", "using last year's baseline."]
-    return [f"{rng.choice(subjects)} {rng.choice(verbs)} {rng.choice(objects)} {rng.choice(tails)}"
-            for _ in range(n)]
+    objects = [
+        "the quarterly forecast",
+        "the onboarding checklist",
+        "vendor contracts",
+        "incident runbooks",
+        "shipping latency",
+        "the hiring plan",
+        "capacity targets",
+        "the training budget",
+    ]
+    tails = [
+        "after the steering meeting.",
+        "ahead of the audit.",
+        "for the northern region.",
+        "with input from customers.",
+        "before the holiday freeze.",
+        "using last year's baseline.",
+    ]
+    return [f"{rng.choice(subjects)} {rng.choice(verbs)} {rng.choice(objects)} {rng.choice(tails)}" for _ in range(n)]
 
 
 def make_bench_files(out: Path, workdir: Path) -> None:
@@ -234,15 +312,49 @@ def make_bench_files(out: Path, workdir: Path) -> None:
 
     lecture = workdir / "lecture.aiff"
     subprocess.run(["say", "-o", str(lecture), " ".join(filler_sentences(260, seed=7))], check=True)
-    subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(lecture), "-t", "600",
-                    "-ar", "16000", "-ac", "1", str(out / "bench_lecture_10min.mp3")], check=True)
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(lecture),
+            "-t",
+            "600",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            str(out / "bench_lecture_10min.mp3"),
+        ],
+        check=True,
+    )
     seconds = 300
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error",
-         "-f", "lavfi", "-i", f"testsrc2=size=1280x720:rate=25:duration={seconds}",
-         "-i", str(out / "bench_lecture_10min.mp3"), "-t", str(seconds),
-         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-c:a", "aac",
-         str(out / "bench_video_5min.mp4")],
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=1280x720:rate=25:duration={seconds}",
+            "-i",
+            str(out / "bench_lecture_10min.mp3"),
+            "-t",
+            str(seconds),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(out / "bench_video_5min.mp4"),
+        ],
         check=True,
     )
 
@@ -251,8 +363,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", default="samples/corpus")
     parser.add_argument("--large", action="store_true", help="also generate a ~1 GB video")
-    parser.add_argument("--bench", action="store_true",
-                        help="also generate samples/bench/ (100-page PDF, 10-min audio, 5-min video)")
+    parser.add_argument(
+        "--bench", action="store_true", help="also generate samples/bench/ (100-page PDF, 10-min audio, 5-min video)"
+    )
     args = parser.parse_args()
 
     for tool in ("say", "ffmpeg", "ffprobe"):

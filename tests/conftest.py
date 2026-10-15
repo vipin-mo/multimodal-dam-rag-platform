@@ -1,129 +1,168 @@
+"""Shared fixtures. Unit tests run against in-memory SQLite and faked S3/Qdrant/Celery/LLM
+clients; nothing touches the network. Integration tests (tests/integration) use real services."""
+
 import os
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from unittest.mock import MagicMock, patch
 
-# Enforce an isolated in-memory SQLite engine for test isolation
-TEST_DATABASE_URL = "sqlite:///:memory:"
+# Must be set before any `app.*` import. setdefault lets CI point integration tests at real services.
+os.environ.setdefault("JWT_SECRET", "unit-test-secret-key-that-is-long-enough-0123456789")
+os.environ.setdefault("DATABASE_URL", "sqlite://")
+os.environ.setdefault("CELERY_BROKER_URL", "memory://")
+os.environ.setdefault("CELERY_RESULT_BACKEND", "cache+memory://")
+os.environ.setdefault("MINIO_ACCESS_KEY", "test-access")
+os.environ.setdefault("MINIO_SECRET_KEY", "test-secret-key")
+os.environ.setdefault("MINIO_ENDPOINT", "http://localhost:9000")
+os.environ.setdefault("QDRANT_HOST", "localhost")
+os.environ.setdefault("ADMIN_PASSWORD", "admin-pass-123")
+os.environ.setdefault("CAPTION_IMAGES", "false")
 
-engine = create_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
-TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+from types import SimpleNamespace  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
 
-# Standardize mock environments before core application loads
-os.environ["JWT_SECRET"] = "test-suite-secret-key-2026-enterprise-dam"
-os.environ["MINIO_ENDPOINT"] = "http://mock-minio:9000"
-os.environ["QDRANT_HOST"] = "mock-vector-db"
-os.environ["SHARED_MEDIA_DIR"] = "/tmp/shared-media"
+import pytest  # noqa: E402
 
-from app.database import Base, User, hash_password
-from app.main import app, get_db
+from app.database import Asset, Base, SessionLocal, User, engine, hash_password  # noqa: E402
+
+PDF_BYTES = b"%PDF-1.4\n%fake test document\n"
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def scored(payload: dict, score: float = 0.9):
+    return SimpleNamespace(payload=payload, score=score)
 
 
 @pytest.fixture(scope="session", autouse=True)
-def setup_test_database():
-    """Initializes in-memory relational schemas and seeds standard authorization roles."""
+def _schema():
     Base.metadata.create_all(bind=engine)
-    db = TestingSessionLocal()
-    try:
-        admin_user = User(
-            username="test_admin",
-            hashed_password=hash_password("admin123"),
-            role="admin"
-        )
-        viewer_user = User(
-            username="test_viewer",
-            hashed_password=hash_password("viewer123"),
-            role="viewer"
-        )
-        db.add(admin_user)
-        db.add(viewer_user)
-        db.commit()
-    finally:
-        db.close()
+    with SessionLocal() as db:
+        if not db.get(User, "test_admin"):
+            db.add_all(
+                [
+                    User(username="test_admin", hashed_password=hash_password("admin-pass-123"), role="admin"),
+                    User(username="test_viewer", hashed_password=hash_password("viewer-pass-123"), role="viewer"),
+                ]
+            )
+            db.commit()
     yield
-    Base.metadata.drop_all(bind=engine)
-
-
-@pytest.fixture
-def db_session():
-    """Provides an isolated transactional database session wrapper for individual tests."""
-    connection = engine.connect()
-    transaction = connection.begin()
-    session = TestingSessionLocal(bind=connection)
-
-    yield session
-
-    session.close()
-    transaction.rollback()
-    connection.close()
 
 
 @pytest.fixture(autouse=True)
-def override_dependencies(db_session):
-    """Overrides application database dependencies with the test session context."""
-    app.dependency_overrides[get_db] = lambda: db_session
+def _clean_assets():
     yield
-    app.dependency_overrides.clear()
+    with SessionLocal() as db:
+        db.query(Asset).delete()
+        db.commit()
 
 
-@pytest.fixture(scope="session", autouse=True)
-def mock_infrastructure_drivers():
-    """Mocks external network infrastructure dependencies (S3/MinIO, Qdrant, and Celery)."""
-    with patch("boto3.client") as mock_boto, \
-         patch("app.main.qdrant_client") as mock_qdrant, \
-         patch("app.main.s3_client") as mock_main_s3, \
-         patch("celery.Celery.send_task") as mock_celery_task:
+@pytest.fixture
+def fake_s3(monkeypatch):
+    from app import storage
 
-        # Configure Boto3/S3 Client Mocks
-        mock_s3_instance = MagicMock()
-        mock_s3_instance.list_objects_v2.return_value = {
-            "Contents": [
-                {
-                    "Key": "mock_file_1.mp4",
-                    "Size": 1048576,
-                    "LastModified": MagicMock(isoformat=lambda: "2026-09-12T00:00:00Z")
-                }
-            ]
+    s3 = MagicMock(name="s3")
+    s3.generate_presigned_url.side_effect = lambda op, Params, ExpiresIn: (
+        f"http://localhost:9000/{Params['Key']}?op={op}&part={Params.get('PartNumber', '')}"
+    )
+    s3.create_multipart_upload.return_value = {"UploadId": "upload-123"}
+
+    def upload_fileobj(fileobj, bucket, key, ExtraArgs=None, Config=None):
+        while fileobj.read(1024 * 1024):  # drain like boto3 does
+            pass
+
+    s3.upload_fileobj.side_effect = upload_fileobj
+    monkeypatch.setattr(storage, "s3", s3)
+    monkeypatch.setattr(storage, "s3_public", s3)
+    return s3
+
+
+@pytest.fixture
+def fake_qdrant(monkeypatch):
+    from app import vectors
+
+    qdrant = MagicMock(name="qdrant")
+    qdrant.search.return_value = []
+    qdrant.scroll.return_value = ([], None)
+    monkeypatch.setattr(vectors, "qdrant", qdrant)
+    return qdrant
+
+
+@pytest.fixture
+def fake_models(monkeypatch):
+    from app import embeddings
+
+    calls = SimpleNamespace(texts=[], clip=[], images=0)
+
+    def embed_texts(texts):
+        calls.texts.extend(texts)
+        return [[0.0] * 384 for _ in texts]
+
+    def embed_clip_text(text):
+        calls.clip.append(text)
+        return [0.0] * 512
+
+    def embed_images(images):
+        calls.images += len(images)
+        return [[0.0] * 512 for _ in images]
+
+    monkeypatch.setattr(embeddings, "embed_texts", embed_texts)
+    monkeypatch.setattr(embeddings, "embed_clip_text", embed_clip_text)
+    monkeypatch.setattr(embeddings, "embed_images", embed_images)
+    return calls
+
+
+@pytest.fixture
+def fake_celery(monkeypatch):
+    from app import main
+
+    send = MagicMock(name="send_task", return_value=SimpleNamespace(id="task-abc"))
+    monkeypatch.setattr(main.celery_client, "send_task", send)
+    return send
+
+
+@pytest.fixture
+def client(fake_s3, fake_qdrant, fake_models, fake_celery):
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    # Not used as a context manager: the lifespan (DB/bucket/collection init) is skipped.
+    return TestClient(app)
+
+
+def _token(client, username: str, password: str) -> dict:
+    res = client.post("/api/token", data={"username": username, "password": password})
+    assert res.status_code == 200, res.text
+    return {"Authorization": f"Bearer {res.json()['access_token']}"}
+
+
+@pytest.fixture
+def admin_headers(client):
+    return _token(client, "test_admin", "admin-pass-123")
+
+
+@pytest.fixture
+def viewer_headers(client):
+    return _token(client, "test_viewer", "viewer-pass-123")
+
+
+@pytest.fixture
+def make_asset():
+    def _make(**overrides) -> Asset:
+        import uuid
+
+        asset_id = overrides.pop("id", str(uuid.uuid4()))
+        fields = {
+            "filename": "report.pdf",
+            "media_type": "document",
+            "content_type": "application/pdf",
+            "size_bytes": 1234,
+            "status": "ready",
+            "uploaded_by": "test_admin",
+            **overrides,
         }
-        mock_s3_instance.generate_presigned_url.return_value = "http://localhost:9000/dam-media/mock_file_1.mp4?signature=valid"
-        mock_boto.return_value = mock_s3_instance
-        mock_main_s3.upload_fileobj.return_value = True
+        fields.setdefault("object_key", f"{asset_id}/{fields['filename']}")
+        with SessionLocal() as db:
+            asset = Asset(id=asset_id, **fields)
+            db.add(asset)
+            db.commit()
+            return asset
 
-        # Configure Celery Async Dispatch Mock
-        mock_celery_task.return_value = MagicMock(id="mock-task-uuid-12345")
-
-        # Configure Qdrant Vector Search Client Mocks
-        mock_text_search_result = MagicMock()
-        mock_text_search_result.payload = {
-            "filename": "mock_file_1.mp4",
-            "text": "Extracted search context snippet.",
-            "timestamp": 20.0
-        }
-        mock_text_search_result.score = 0.89
-
-        mock_visual_search_result = MagicMock()
-        mock_visual_search_result.payload = {
-            "filename": "mock_file_1.mp4",
-            "timestamp": 20.0
-        }
-        mock_visual_search_result.score = 0.78
-
-        mock_qdrant.search.side_effect = lambda collection_name, **kwargs: (
-            [mock_text_search_result] if collection_name == "text_chunks" else [mock_visual_search_result]
-        )
-
-        # Mock Scroll endpoint for RAG context extraction
-        mock_point = MagicMock()
-        mock_point.payload = {
-            "filename": "mock_file_1.mp4",
-            "text": "Grounding transcript slice content.",
-            "timestamp": 10.0
-        }
-        mock_qdrant.scroll.return_value = ([mock_point], None)
-
-        yield {
-            "s3": mock_s3_instance,
-            "qdrant": mock_qdrant,
-            "celery": mock_celery_task
-        }
+    return _make

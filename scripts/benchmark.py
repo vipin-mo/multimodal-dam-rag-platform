@@ -24,7 +24,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -71,9 +71,7 @@ class Api:
             time.sleep(poll)
 
     def search(self, query: str, limit: int, client: httpx.Client | None = None) -> dict:
-        res = (client or self.client).get(
-            "/api/search", params={"query": query, "limit": limit}, headers=self.headers
-        )
+        res = (client or self.client).get("/api/search", params={"query": query, "limit": limit}, headers=self.headers)
         res.raise_for_status()
         return res.json()
 
@@ -89,8 +87,7 @@ def normalize(text: str) -> str:
 
 
 def record(args, kind: str, payload: dict) -> None:
-    payload = {"kind": kind, "api": args.api, "at": datetime.now(timezone.utc).isoformat(),
-               "label": args.label, **payload}
+    payload = {"kind": kind, "api": args.api, "at": datetime.now(UTC).isoformat(), "label": args.label, **payload}
     out = Path(args.results)
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("a") as fh:
@@ -111,18 +108,21 @@ def cmd_ingest(api: Api, args) -> None:
         t_uploaded = time.perf_counter()
         status = api.wait(task_id)
         t_done = time.perf_counter()
-        rows.append({
-            "file": path.name,
-            "bytes": path.stat().st_size,
-            "state": status["state"],
-            "upload_s": round(t_uploaded - t0, 3),
-            "processing_s": round(t_done - t_uploaded, 3),
-            "result": status.get("result"),
-        })
-        print(f"{path.name:<28} {status['state']:<8} upload {t_uploaded - t0:6.2f}s  "
-              f"processing {t_done - t_uploaded:7.2f}s")
-    record(args, "ingest", {"files": rows,
-                            "total_processing_s": round(sum(r["processing_s"] for r in rows), 2)})
+        rows.append(
+            {
+                "file": path.name,
+                "bytes": path.stat().st_size,
+                "state": status["state"],
+                "upload_s": round(t_uploaded - t0, 3),
+                "processing_s": round(t_done - t_uploaded, 3),
+                "result": status.get("result"),
+            }
+        )
+        print(
+            f"{path.name:<28} {status['state']:<8} upload {t_uploaded - t0:6.2f}s  "
+            f"processing {t_done - t_uploaded:7.2f}s"
+        )
+    record(args, "ingest", {"files": rows, "total_processing_s": round(sum(r["processing_s"] for r in rows), 2)})
 
 
 # ---------------------------------------------------------------- latency
@@ -136,7 +136,7 @@ def cmd_search(api: Api, args) -> None:
         latencies: list[float] = []
         lock = threading.Lock()
 
-        def worker(i: int) -> None:
+        def worker(i: int, latencies=latencies, lock=lock) -> None:
             with httpx.Client(base_url=api.base, timeout=120) as c:
                 t0 = time.perf_counter()
                 api.search(queries[i % len(queries)], 5, client=c)
@@ -167,8 +167,11 @@ def cmd_eval(api: Api, args) -> None:
     for item in questions["text"]:
         matches = api.search(item["q"], k)["text_matches"][:k]
         rank = next(
-            (i + 1 for i, m in enumerate(matches)
-             if m["filename"] == item["file"] and normalize(item["answer"]) in normalize(m.get("text", ""))),
+            (
+                i + 1
+                for i, m in enumerate(matches)
+                if m["filename"] == item["file"] and normalize(item["answer"]) in normalize(m.get("text", ""))
+            ),
             None,
         )
         text_hits += rank is not None
@@ -182,14 +185,18 @@ def cmd_eval(api: Api, args) -> None:
         visual_hits += any(m["filename"] == item["file"] for m in matches)
 
     n_text, n_vis = len(questions["text"]), len(questions["visual"])
-    record(args, "retrieval_eval", {
-        "k": k,
-        "text_recall_at_k": round(text_hits / n_text, 3),
-        "text_hits": f"{text_hits}/{n_text}",
-        "text_mrr": round(sum(rr) / n_text, 3),
-        "visual_hit_at_k": f"{visual_hits}/{n_vis}",
-        "misses": misses,
-    })
+    record(
+        args,
+        "retrieval_eval",
+        {
+            "k": k,
+            "text_recall_at_k": round(text_hits / n_text, 3),
+            "text_hits": f"{text_hits}/{n_text}",
+            "text_mrr": round(sum(rr) / n_text, 3),
+            "visual_hit_at_k": f"{visual_hits}/{n_vis}",
+            "misses": misses,
+        },
+    )
 
 
 # ---------------------------------------------------------------- upload memory
@@ -208,7 +215,9 @@ class MemorySampler(threading.Thread):
     def sample(self) -> dict[str, float]:
         out = subprocess.run(
             ["docker", "stats", "--no-stream", "--format", "{{.Name}} {{.MemUsage}}", *self.containers],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout
         usage = {}
         for line in out.strip().splitlines():
@@ -252,8 +261,7 @@ def cmd_upload(api: Api, args) -> None:
         sampler.stop.set()
         sampler.join()
         payload["memory_mib"] = {
-            c: {"baseline": round(sampler.baseline.get(c, 0), 1), "peak": round(sampler.peak[c], 1)}
-            for c in args.watch
+            c: {"baseline": round(sampler.baseline.get(c, 0), 1), "peak": round(sampler.peak[c], 1)} for c in args.watch
         }
     record(args, "upload", payload)
 

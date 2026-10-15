@@ -33,9 +33,7 @@ def _put_part(url: str, data: bytes, attempts: int = 3) -> str:
 def direct_upload(client: httpx.Client, headers: dict, path: Path, progress: bool = False) -> dict:
     """Runs init -> PUT parts -> complete. Returns the gateway's completion response."""
     size = path.stat().st_size
-    init = client.post(
-        "/api/uploads/init", headers=headers, json={"filename": path.name, "size_bytes": size}
-    )
+    init = client.post("/api/uploads/init", headers=headers, json={"filename": path.name, "size_bytes": size})
     init.raise_for_status()
     plan = init.json()
     asset_id, upload_id, part_size = plan["asset_id"], plan["upload_id"], plan["part_size"]

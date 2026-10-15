@@ -1,0 +1,40 @@
+[project]
+name = "multimodal-dam"
+version = "2.0.0"
+description = "Multimodal digital asset management with semantic search and RAG"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["samples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM"]
+ignore = [
+    "B008",  # FastAPI's Depends()/Query() defaults are idiomatic
+    "B904",  # HTTPException inside except is intentional; tracebacks are logged separately
+    "S101",  # assert is fine in tests
+    "S603", "S607",  # subprocess calls in scripts use fixed argument lists
+    "S311",  # random is used for jitter and test data, not security
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S105", "S106"]  # test passwords
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: needs live Qdrant, Postgres, MinIO and model downloads"]
+addopts = "-m 'not integration'"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["app/ui.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
