@@ -83,7 +83,9 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 def normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9.:,\- ]+", " ", text.lower()).replace(",", "").strip()
+    """Lowercase, hyphens as spaces, drop thousands separators and other punctuation."""
+    text = re.sub(r"(?<=\d),(?=\d)", "", text.lower()).replace("-", " ")
+    return " ".join(re.sub(r"[^a-z0-9.: ]+", " ", text).split())
 
 
 def record(args, kind: str, payload: dict) -> None:
@@ -170,7 +172,8 @@ def cmd_eval(api: Api, args) -> None:
             (
                 i + 1
                 for i, m in enumerate(matches)
-                if m["filename"] == item["file"] and normalize(item["answer"]) in normalize(m.get("text", ""))
+                if m["filename"] == item["file"]
+                and any(normalize(a) in normalize(m.get("text") or "") for a in item["answer"])
             ),
             None,
         )
