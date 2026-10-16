@@ -9,12 +9,13 @@ Everything runs locally in Docker on CPU: FastAPI, Celery, Qdrant, Postgres, Min
 
 ![Search, jump to the matching moment in a video, and a cited RAG answer](docs/images/demo.gif)
 
-## Measured results
+## v1 → v2 results
 
-Old code versus this version, from the same benchmark harness. See
+v1 (Sep 2026, tag `v1.0`) was a working prototype. v2 (Oct 2026, tag `v2.0`) is a rewrite driven
+by profiling v1. Both were measured with the same benchmark script. See
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for setup, method and caveats.
 
-| | Before | After |
+| | v1 | v2 |
 |---|---:|---:|
 | Ingest a 100-page PDF | 33.9 s | **3.1 s** (11×) |
 | Ingest a 5-min video with speech | 30.5 s | **12.8 s** (2.4×) |
@@ -22,6 +23,18 @@ Old code versus this version, from the same benchmark harness. See
 | Search throughput at 8 concurrent clients | 15 req/s | **30 req/s** |
 | Gateway memory growth during a 1 GB upload | +56 MiB (through the API) | **+0 MiB** (direct to storage) |
 | Image size: API / worker / UI | 11.7 GB each | **2.0 / 2.4 / 0.8 GB** |
+
+## Project history
+
+- **v1 (Sep 2026):** built the end-to-end pipeline: ingestion of PDFs, images, audio and video,
+  two vector indexes, search, RAG and summaries in a Streamlit UI.
+- **v2 (Oct 2026):** measured v1, found the bottlenecks and fixed them. This covered performance
+  (batched local embedding, concurrent search), retrieval quality (sentence-aware chunking),
+  security (secrets, auth, upload validation), reliability (background LLM worker, retry policy),
+  a real test suite with CI, and new features: an asset catalog, direct large uploads, image
+  captions, cited answers and deduplication.
+
+To reproduce the comparison, check out each tag and run `scripts/benchmark.py`; v1 needs `--api legacy`.
 
 ## What it does
 
@@ -108,7 +121,7 @@ Prometheus and Grafana add 2 more under the `monitoring` profile.
 
 ### Design decisions
 
-- **The worker embeds locally.** The original design sent every text chunk to the gateway over
+- **The worker embeds locally.** v1 sent every text chunk to the gateway over
   HTTP: one call per PDF line, on an unauthenticated endpoint. Removing that hop made PDFs about
   9× faster with the same thread budget and closed the security hole.
 - **Vectors are keyed by asset ID, with deterministic point IDs.** Re-indexing deletes and rewrites
@@ -203,7 +216,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 - **Network.** CORS is limited to `CORS_ORIGINS`. Postgres and Redis aren't published to the host,
   and other ports bind to 127.0.0.1 by default. Redis requires a password. Containers run as a
   non-root user.
-- **Old credentials.** Commits before v2 contained hardcoded local-development credentials
+- **v1 credentials.** v1 commits contained hardcoded local-development credentials
   (`admin123`, `guest:guest`, MinIO keys). They were only ever used in local Docker, and nothing
   in the current code accepts them.
 
