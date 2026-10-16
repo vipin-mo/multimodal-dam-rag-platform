@@ -70,6 +70,14 @@ To reproduce the comparison, check out each tag and run `scripts/benchmark.py`; 
   latency, LLM latency and retries for RAG calls, and asset counts. The Celery workers are not
   scraped.
 
+## Screenshots
+
+| Search → play at the matching moment | RAG answer with citations |
+|---|---|
+| ![Search hit opening the video at its timestamp](docs/images/search-playback.png) | ![Cited answer with sources and jump-to buttons](docs/images/rag-citations.png) |
+| **Library: asset details and summary** | **Batch upload with live progress** |
+| ![Library tab with ingestion stats and a summary](docs/images/library-summary.png) | ![Per-file ingestion progress](docs/images/upload-progress.png) |
+
 ## Architecture
 
 ```mermaid
