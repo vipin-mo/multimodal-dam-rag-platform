@@ -50,7 +50,8 @@ Old code versus this version, from the same benchmark harness. See
 - **Large files.** Presigned multipart uploads go straight to object storage
   (`scripts/dam_upload.py`). Memory stays bounded by the part size whatever the file size.
 - **Monitoring (optional).** Prometheus and a provisioned Grafana dashboard show request rate, p95
-  latency, LLM latency and retries, and asset counts.
+  latency, LLM latency and retries for RAG calls, and asset counts. The Celery workers are not
+  scraped.
 
 ## Architecture
 
@@ -162,6 +163,8 @@ DAM_PASSWORD=<admin password> python scripts/dam_upload.py path/to/video.mp4
 **Monitoring:** run `docker compose --profile monitoring up -d`. Grafana is at
 http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and comes with a
 **DAM Gateway** dashboard.
+
+![Grafana dashboard](docs/images/grafana.png)
 
 ## API
 

@@ -66,7 +66,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(http_requests_total{handler=~\"/api/.*\",status=\"5xx\"}[5m])) / clamp_min(sum(rate(http_requests_total{handler=~\"/api/.*\"}[5m])), 1e-9)",
+          "expr": "(sum(rate(http_requests_total{handler=~\"/api/.*\",status=\"5xx\"}[5m])) or vector(0)) / clamp_min(sum(rate(http_requests_total{handler=~\"/api/.*\"}[5m])), 1e-9)",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -241,7 +241,7 @@
     {
       "id": 7,
       "type": "timeseries",
-      "title": "RAG & summary latency (p95)",
+      "title": "RAG latency (p50 / p95)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -271,8 +271,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{handler=\"/api/rag\"}[5m])))",
-          "legendFormat": "rag",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(http_request_duration_seconds_bucket{handler=\"/api/rag\"}[5m])))",
+          "legendFormat": "p50",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -280,8 +280,8 @@
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{handler=\"/api/assets/{asset_id}/summary\"}[5m])))",
-          "legendFormat": "summary",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(http_request_duration_seconds_bucket{handler=\"/api/rag\"}[5m])))",
+          "legendFormat": "p95",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
@@ -292,7 +292,7 @@
     {
       "id": 8,
       "type": "timeseries",
-      "title": "LLM call latency p95 by model",
+      "title": "LLM call latency p95 by model (gateway: RAG)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -334,7 +334,7 @@
     {
       "id": 9,
       "type": "timeseries",
-      "title": "LLM retries",
+      "title": "LLM retries (gateway)",
       "datasource": {
         "type": "prometheus",
         "uid": "prometheus"
@@ -364,8 +364,8 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (model) (increase(dam_llm_retries_total[5m]))",
-          "legendFormat": "{{model}}",
+          "expr": "sum(increase(dam_llm_retries_total[5m])) or vector(0)",
+          "legendFormat": "retries / 5m",
           "datasource": {
             "type": "prometheus",
             "uid": "prometheus"
