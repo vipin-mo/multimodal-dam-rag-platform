@@ -125,6 +125,40 @@ def test_search_bounds_are_validated(client, viewer_headers):
     assert res.status_code == 422
 
 
+def _frame(asset_id, start, score):
+    return scored(
+        {
+            "asset_id": asset_id,
+            "filename": f"{asset_id}.mp4",
+            "media_type": "video",
+            "kind": "video_frame",
+            "start": start,
+            "end": start + 2,
+        },
+        score,
+    )
+
+
+def test_visual_results_keep_one_frame_per_video_moment(client, viewer_headers, fake_qdrant):
+    frames = [
+        _frame("v1", 14, 0.30),
+        _frame("v1", 16, 0.29),
+        _frame("v1", 18, 0.29),  # same scene
+        _frame("v2", 3, 0.28),
+        _frame("v1", 40, 0.27),
+        _frame("v1", 42, 0.26),
+    ]
+    fake_qdrant.search.side_effect = lambda collection, **kw: frames if collection == "image_features" else []
+    body = client.get("/api/search", headers=viewer_headers, params={"query": "scene", "limit": 5}).json()
+    assert [(m["asset_id"], m["start"]) for m in body["visual_matches"]] == [("v1", 14), ("v2", 3), ("v1", 40)]
+    assert fake_qdrant.search.call_args_list[-1].kwargs["limit"] == 20  # over-fetched
+
+
+def test_diversify_keeps_one_point_per_still_image():
+    hits = [scored({"asset_id": "img", "start": None}, 0.9), scored({"asset_id": "img", "start": None}, 0.8)]
+    assert len(main.diversify(hits, limit=5, window_seconds=10)) == 1
+
+
 # ---------------------------------------------------------------- RAG
 def test_rag_without_hits_does_not_call_llm(client, viewer_headers, monkeypatch):
     chat = AsyncMock()
@@ -235,6 +269,13 @@ def test_ready_reports_warming_models_as_not_ready(client, monkeypatch, fake_s3,
     res = client.get("/ready")
     assert res.status_code == 200
     assert res.json()["checks"]["llm"] in ("ok", "unavailable")
+
+
+def test_ready_reports_unreachable_dependency(client, monkeypatch, fake_qdrant):
+    monkeypatch.setattr(embeddings, "loaded", lambda: True)
+    fake_qdrant.get_collections.side_effect = ConnectionError("refused")
+    body = client.get("/ready").json()
+    assert body["ready"] is False and body["checks"]["qdrant"] == "unreachable"
 
 
 def test_unexpected_errors_do_not_leak_internals(client, viewer_headers, fake_qdrant):

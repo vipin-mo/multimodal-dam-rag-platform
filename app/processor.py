@@ -7,6 +7,7 @@ asset are deleted first and point ids are deterministic.
 import asyncio
 import base64
 import contextlib
+import hashlib
 import io
 import logging
 import os
@@ -82,6 +83,14 @@ class Job:
         return {"asset_id": self.asset_id, "filename": self.filename, "media_type": self.media_type, **extra}
 
 
+def file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        while block := fh.read(2**20):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def batched(items: Iterable, size: int) -> Iterator[list]:
     it = iter(items)
     while batch := list(islice(it, size)):
@@ -95,7 +104,7 @@ def ingest_asset(self, asset_id: str) -> dict:
         asset = db.get(Asset, asset_id)
         if asset is None:
             return {"skipped": "asset no longer exists"}
-        filename, key, media_type = asset.filename, asset.object_key, asset.media_type
+        filename, key, media_type, expected_sha = asset.filename, asset.object_key, asset.media_type, asset.sha256
 
     def report(progress: int, stage: str) -> None:
         self.update_state(state="PROGRESS", meta={"progress": progress, "stage": stage})
@@ -113,6 +122,10 @@ def ingest_asset(self, asset_id: str) -> dict:
         with open(local_path, "rb") as fh:
             if not media.sniff_ok(ext, fh.read(64)):
                 raise media.UnsupportedMediaError("File content does not match its extension.")
+        sha256 = file_sha256(local_path)
+        if expected_sha and sha256 != expected_sha:
+            raise ValueError("SHA-256 of the stored object does not match the hash sent at upload.")
+        update_asset(asset_id, sha256=sha256)
 
         vectors.delete_asset(asset_id)  # idempotent re-indexing
         job = Job(asset_id, filename, media_type, local_path, report)

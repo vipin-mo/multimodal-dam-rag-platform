@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import hashlib
 import os
 import sys
 import time
@@ -30,10 +31,28 @@ def _put_part(url: str, data: bytes, attempts: int = 3) -> str:
     raise RuntimeError("unreachable")
 
 
-def direct_upload(client: httpx.Client, headers: dict, path: Path, progress: bool = False) -> dict:
-    """Runs init -> PUT parts -> complete. Returns the gateway's completion response."""
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        while block := fh.read(2**20):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+class DuplicateAsset(Exception):
+    pass
+
+
+def direct_upload(
+    client: httpx.Client, headers: dict, path: Path, progress: bool = False, allow_duplicate: bool = False
+) -> dict:
+    """Runs init -> PUT parts -> complete. Returns the gateway's completion response.
+    The SHA-256 is sent first so the server can reject a duplicate before any bytes are uploaded."""
     size = path.stat().st_size
-    init = client.post("/api/uploads/init", headers=headers, json={"filename": path.name, "size_bytes": size})
+    body = {"filename": path.name, "size_bytes": size, "sha256": file_sha256(path), "allow_duplicate": allow_duplicate}
+    init = client.post("/api/uploads/init", headers=headers, json=body)
+    if init.status_code == 409:
+        raise DuplicateAsset(init.json()["detail"])
     init.raise_for_status()
     plan = init.json()
     asset_id, upload_id, part_size = plan["asset_id"], plan["upload_id"], plan["part_size"]
@@ -69,6 +88,7 @@ def main() -> None:
     parser.add_argument("--api", default=os.getenv("DAM_API_URL", "http://localhost:8000"))
     parser.add_argument("--user", default=os.getenv("DAM_USER", "admin"))
     parser.add_argument("--password", default=os.getenv("DAM_PASSWORD"))
+    parser.add_argument("--allow-duplicate", action="store_true", help="upload even if the content already exists")
     args = parser.parse_args()
     if not args.password:
         sys.exit("Set DAM_PASSWORD or pass --password.")
@@ -78,7 +98,10 @@ def main() -> None:
         token.raise_for_status()
         headers = {"Authorization": f"Bearer {token.json()['access_token']}"}
         t0 = time.perf_counter()
-        result = direct_upload(client, headers, args.file, progress=True)
+        try:
+            result = direct_upload(client, headers, args.file, progress=True, allow_duplicate=args.allow_duplicate)
+        except DuplicateAsset as exc:
+            sys.exit(f"Skipped: {exc}\n(From this script, pass --allow-duplicate.)")
         elapsed = time.perf_counter() - t0
     mib = args.file.stat().st_size / 2**20
     print(f"Uploaded {mib:.1f} MiB in {elapsed:.1f}s ({mib / elapsed:.1f} MiB/s)")

@@ -1,6 +1,7 @@
 """API gateway: auth, uploads, asset catalog, search, RAG and summaries."""
 
 import asyncio
+import hashlib
 import logging
 import re
 import uuid
@@ -160,18 +161,53 @@ def get_asset(asset_id: str, db: Session = Depends(get_db)) -> Asset:
     return asset
 
 
-class _LimitedReader:
-    """File wrapper that counts bytes and aborts once the limit is crossed."""
-
-    def __init__(self, fileobj, limit: int):
-        self.fileobj, self.limit, self.count = fileobj, limit, 0
-
-    def read(self, size: int = -1) -> bytes:
-        data = self.fileobj.read(size)
-        self.count += len(data)
-        if self.count > self.limit:
+def hash_upload(fileobj, limit: int) -> tuple[str, int]:
+    """SHA-256 and size of a spooled upload, read in 1 MiB blocks; raises OverflowError past `limit`."""
+    digest, size = hashlib.sha256(), 0
+    while block := fileobj.read(2**20):
+        size += len(block)
+        if size > limit:
             raise OverflowError
-        return data
+        digest.update(block)
+    fileobj.seek(0)
+    return digest.hexdigest(), size
+
+
+def reject_duplicate(db: Session, sha256: str) -> None:
+    existing = (
+        db.query(Asset).filter(Asset.sha256 == sha256, Asset.status != "failed").order_by(Asset.created_at).first()
+    )
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Already in the library as '{existing.filename}' (asset {existing.id}). "
+                "Upload again with allow_duplicate=true to keep both."
+            ),
+        )
+
+
+def _close_in_time(a: dict, b: dict, window_seconds: float) -> bool:
+    if a.get("start") is None or b.get("start") is None:
+        return True  # still images: one point per asset
+    return abs(a["start"] - b["start"]) < window_seconds
+
+
+def diversify(points: list, limit: int, window_seconds: float) -> list:
+    """Keeps the best-scoring hit per asset per time window (points arrive sorted by score)."""
+    kept: list = []
+    for point in points:
+        payload = point.payload or {}
+        if any(
+            (k.payload or {}).get("asset_id") == payload.get("asset_id")
+            and _close_in_time(k.payload or {}, payload, window_seconds)
+            for k in kept
+        ):
+            continue
+        kept.append(point)
+        if len(kept) == limit:
+            break
+    return kept
 
 
 # ====================================================================== health
@@ -190,8 +226,9 @@ def ready():
         try:
             fn()
             checks[name] = "ok"
-        except Exception as exc:  # noqa: BLE001 - surfaced in the response
-            checks[name] = f"error: {type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001 - reported as unreachable, details in the log
+            logger.warning("Readiness check %s failed: %r", name, exc)
+            checks[name] = "unreachable"
 
     def db_ping():
         with engine.connect() as conn:
@@ -231,9 +268,15 @@ def me(user: User = Depends(require_user)):
 
 # ====================================================================== uploads
 @app.post("/api/upload", status_code=status.HTTP_202_ACCEPTED)
-def upload_asset(file: UploadFile = File(...), user: User = Depends(require_admin), db: Session = Depends(get_db)):
-    """Multipart upload for files up to MAX_UPLOAD_MB. Streams to object storage in 16 MiB parts
-    (the request body is spooled to disk by Starlette, never held in memory) and queues ingestion."""
+def upload_asset(
+    file: UploadFile = File(...),
+    allow_duplicate: bool = False,
+    user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Multipart upload for files up to MAX_UPLOAD_MB. The spooled body (on disk, never held in memory)
+    is hashed first; identical content already in the library returns 409 unless allow_duplicate=true.
+    Then it streams to object storage in 16 MiB parts and ingestion is queued."""
     safe_name = media.sanitize_filename(file.filename or "")
     try:
         media_type, content_type = media.classify(safe_name)
@@ -245,13 +288,16 @@ def upload_asset(file: UploadFile = File(...), user: User = Depends(require_admi
     if not media.sniff_ok(media.extension(safe_name), head):
         raise HTTPException(status_code=415, detail="File content does not match its extension.")
 
-    asset_id = str(uuid.uuid4())
-    key = media.object_key(asset_id, safe_name)
-    reader = _LimitedReader(file.file, MAX_UPLOAD_BYTES)
     try:
-        storage.upload_stream(reader, key, content_type)
+        sha256, size = hash_upload(file.file, MAX_UPLOAD_BYTES)
     except OverflowError:
         raise HTTPException(status_code=413, detail=f"File exceeds {config.MAX_UPLOAD_MB} MB.")
+    if not allow_duplicate:
+        reject_duplicate(db, sha256)
+
+    asset_id = str(uuid.uuid4())
+    key = media.object_key(asset_id, safe_name)
+    storage.upload_stream(file.file, key, content_type)
 
     asset = Asset(
         id=asset_id,
@@ -259,7 +305,8 @@ def upload_asset(file: UploadFile = File(...), user: User = Depends(require_admi
         object_key=key,
         media_type=media_type,
         content_type=content_type,
-        size_bytes=reader.count,
+        size_bytes=size,
+        sha256=sha256,
         status="queued",
         uploaded_by=user.username,
     )
@@ -273,6 +320,10 @@ def upload_asset(file: UploadFile = File(...), user: User = Depends(require_admi
 class DirectUploadInit(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     size_bytes: int = Field(gt=0)
+    # Optional: lets the server reject a duplicate before any bytes are sent. The worker re-hashes
+    # the stored object and fails the asset if it doesn't match.
+    sha256: str | None = Field(None, pattern="^[0-9a-f]{64}$")
+    allow_duplicate: bool = False
 
 
 class CompletedPart(BaseModel):
@@ -300,6 +351,8 @@ def init_direct_upload(req: DirectUploadInit, user: User = Depends(require_admin
         raise HTTPException(status_code=415, detail=str(exc))
     if req.size_bytes > MAX_DIRECT_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"File exceeds {config.MAX_DIRECT_UPLOAD_MB} MB.")
+    if req.sha256 and not req.allow_duplicate:
+        reject_duplicate(db, req.sha256)
 
     asset_id = str(uuid.uuid4())
     key = media.object_key(asset_id, safe_name)
@@ -313,6 +366,7 @@ def init_direct_upload(req: DirectUploadInit, user: User = Depends(require_admin
             media_type=media_type,
             content_type=content_type,
             size_bytes=req.size_bytes,
+            sha256=req.sha256,
             status="pending_upload",
             uploaded_by=user.username,
             stats={"upload_id": upload_id},
@@ -476,7 +530,9 @@ async def search(
         if media_type in ("document", "audio"):
             return []
         vector = await run_in_threadpool(embeddings.embed_clip_text, q)
-        return await run_in_threadpool(vectors.search, vectors.IMAGE, vector, limit, query_filter)
+        # Over-fetch, then keep one frame per video per time window.
+        hits = await run_in_threadpool(vectors.search, vectors.IMAGE, vector, min(limit * 4, 100), query_filter)
+        return diversify(hits, limit, config.VISUAL_DEDUP_SECONDS)
 
     text_hits, visual_hits = await asyncio.gather(text_matches(), visual_matches())
     return {

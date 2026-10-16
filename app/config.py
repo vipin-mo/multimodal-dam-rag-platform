@@ -72,6 +72,9 @@ FRAME_SAMPLE_SECONDS = float(os.getenv("FRAME_SAMPLE_SECONDS", "2.0"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
 CAPTION_IMAGES = _bool("CAPTION_IMAGES", True)
+# Visual search keeps at most one frame per video within this many seconds, so a single
+# scene can't fill every result slot.
+VISUAL_DEDUP_SECONDS = float(os.getenv("VISUAL_DEDUP_SECONDS", "10"))
 WORK_DIR = os.getenv("WORK_DIR", os.path.join(tempfile.gettempdir(), "dam-work"))
 
 # Upload limits

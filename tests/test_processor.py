@@ -170,3 +170,21 @@ def test_workdir_is_removed_after_task(pdf_file, stored_asset, fake_qdrant, fake
     stored_asset(pdf_file, filename="policy.pdf")
     processor.ingest_asset.apply(args=[ASSET_ID]).get()
     assert list((tmp_path / "work").iterdir()) == []
+
+
+def test_ingest_task_records_sha256(pdf_file, stored_asset, fake_qdrant, fake_models):
+    import hashlib
+
+    stored_asset(pdf_file, filename="policy.pdf")
+    processor.ingest_asset.apply(args=[ASSET_ID]).get()
+    with SessionLocal() as db:
+        assert db.get(Asset, ASSET_ID).sha256 == hashlib.sha256(pdf_file.read_bytes()).hexdigest()
+
+
+def test_ingest_task_fails_on_hash_mismatch(pdf_file, stored_asset, fake_qdrant):
+    stored_asset(pdf_file, filename="policy.pdf", sha256="0" * 64)  # client declared a different hash
+    outcome = processor.ingest_asset.apply(args=[ASSET_ID])
+    assert outcome.failed()
+    with SessionLocal() as db:
+        assert "SHA-256" in db.get(Asset, ASSET_ID).error
+    fake_qdrant.upsert.assert_not_called()

@@ -442,6 +442,9 @@ if is_admin:
                     res = api("POST", "/api/upload", timeout=600, files={"file": (f.name, f, f.type)})
                     jobs.append((res["filename"], res["task_id"]))
                 except ApiError as exc:
-                    st.error(f"{f.name}: {exc}")
+                    if str(exc).startswith("409"):
+                        st.warning(f"{f.name}: skipped, {str(exc)[5:]}")
+                    else:
+                        st.error(f"{f.name}: {exc}")
             if jobs:
                 wait_for_tasks(jobs)

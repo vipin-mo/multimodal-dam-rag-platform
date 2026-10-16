@@ -139,3 +139,52 @@ def test_direct_upload_abort_removes_pending_asset(client, admin_headers, fake_s
     fake_s3.abort_multipart_upload.assert_called_once()
     with SessionLocal() as db:
         assert db.get(Asset, plan["asset_id"]) is None
+
+
+# ---------------------------------------------------------------- duplicate detection
+def test_identical_content_is_rejected_as_duplicate(client, admin_headers, fake_s3, fake_celery):
+    first = _upload(client, admin_headers, "report.pdf", PDF_BYTES)
+    assert first.status_code == 202
+    fake_s3.upload_fileobj.reset_mock()
+
+    dup = _upload(client, admin_headers, "renamed copy.pdf", PDF_BYTES)  # same bytes, different name
+    assert dup.status_code == 409
+    assert first.json()["asset_id"] in dup.json()["detail"]
+    fake_s3.upload_fileobj.assert_not_called()  # rejected before anything is stored
+
+    forced = client.post(
+        "/api/upload",
+        headers=admin_headers,
+        params={"allow_duplicate": "true"},
+        files={"file": ("copy.pdf", io.BytesIO(PDF_BYTES))},
+    )
+    assert forced.status_code == 202
+
+
+def test_upload_records_sha256(client, admin_headers):
+    import hashlib
+
+    asset_id = _upload(client, admin_headers, "report.pdf", PDF_BYTES).json()["asset_id"]
+    with SessionLocal() as db:
+        assert db.get(Asset, asset_id).sha256 == hashlib.sha256(PDF_BYTES).hexdigest()
+
+
+def test_failed_assets_do_not_block_reupload(client, admin_headers, make_asset):
+    import hashlib
+
+    make_asset(status="failed", sha256=hashlib.sha256(PDF_BYTES).hexdigest())
+    assert _upload(client, admin_headers, "report.pdf", PDF_BYTES).status_code == 202
+
+
+def test_direct_upload_duplicate_rejected_before_any_bytes(client, admin_headers, make_asset, fake_s3):
+    make_asset(sha256="a" * 64)
+    body = {"filename": "video.mp4", "size_bytes": 10, "sha256": "a" * 64}
+    assert client.post("/api/uploads/init", headers=admin_headers, json=body).status_code == 409
+    fake_s3.create_multipart_upload.assert_not_called()
+    body["allow_duplicate"] = True
+    assert client.post("/api/uploads/init", headers=admin_headers, json=body).status_code == 201
+
+
+def test_direct_upload_rejects_malformed_hash(client, admin_headers):
+    body = {"filename": "video.mp4", "size_bytes": 10, "sha256": "not-a-hash"}
+    assert client.post("/api/uploads/init", headers=admin_headers, json=body).status_code == 422

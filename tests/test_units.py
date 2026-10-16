@@ -216,6 +216,7 @@ def test_trim_to_sentence(raw, trimmed):
         ("  [2] .", llm.NO_ANSWER, []),
         ("I don't know.", llm.NO_ANSWER, []),
         ("Plain answer without citations.", "Plain answer without citations.", []),
+        ("[2] Due December 15. [2]", "Due December 15. [2]", [2]),
     ],
 )
 def test_finalize_answer(raw, answer, cited):
@@ -227,6 +228,12 @@ def test_cited_numbers():
 
 
 # ---------------------------------------------------------------- map-reduce summaries
+def test_estimate_calls_matches_map_reduce_shape():
+    assert llm.estimate_calls(10_000, budget=16_000) == 1  # fits: single pass
+    # 270k chars -> 17 partials (~20k chars) -> 2 partials -> final: 20 calls, as observed on the 100-page PDF
+    assert llm.estimate_calls(270_000, budget=16_000) == 20
+
+
 def test_pack_blocks_respects_budget():
     windows = llm.pack_blocks(["a" * 40] * 10, budget=100)
     assert all(sum(len(b) + 1 for b in w) <= 100 for w in windows)

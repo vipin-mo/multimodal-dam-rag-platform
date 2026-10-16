@@ -47,6 +47,10 @@ Old code versus this version, from the same benchmark harness. See
   - Summaries run on a separate LLM worker queue, and results are cached.
 - **Asset catalog in Postgres.** It tracks status, ingestion stats, captions and summaries, and
   supports delete (object, vectors and catalog row) and re-index.
+- **Duplicate detection.** Every file is identified by its SHA-256. Uploading content that is
+  already in the library returns `409` with the existing asset, unless `allow_duplicate=true`.
+  The direct uploader sends the hash first, so a duplicate is rejected before any bytes are sent,
+  and the worker re-hashes the stored object as an integrity check.
 - **Large files.** Presigned multipart uploads go straight to object storage
   (`scripts/dam_upload.py`). Memory stays bounded by the part size whatever the file size.
 - **Monitoring (optional).** Prometheus and a provisioned Grafana dashboard show request rate, p95
@@ -110,7 +114,7 @@ Prometheus and Grafana add 2 more under the `monitoring` profile.
 - **Vectors are keyed by asset ID, with deterministic point IDs.** Re-indexing deletes and rewrites
   an asset's points, so retries and re-uploads never create duplicates.
 - **Long LLM work runs off the request path.** A 100-page map-reduce summary is about 20 LLM calls,
-  roughly 3 minutes on CPU. The API returns `202` with a task ID, and a single-concurrency worker
+  3–6 minutes on CPU. The API returns `202` with a task ID, and a single-concurrency worker
   matches Ollama's one-request-at-a-time serving.
 - **LLM retries are selective.** Connection errors and 5xx get exponential backoff with jitter (for
   cold starts). Read timeouts are not retried, because Ollama keeps generating for the abandoned
@@ -172,7 +176,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 |---|---|---|
 | `POST /api/token` | – | OAuth2 password form; returns a JWT |
 | `GET /api/me` | any | Current user |
-| `POST /api/upload` | admin | Multipart upload (≤ `MAX_UPLOAD_MB`); returns `202` with asset ID and task ID |
+| `POST /api/upload` | admin | Multipart upload (≤ `MAX_UPLOAD_MB`); `202` with asset ID and task ID, `409` if the content is already stored |
 | `POST /api/uploads/init` · `/{id}/complete` · `/{id}/abort` | admin | Presigned direct-upload lifecycle |
 | `GET /api/assets` · `/{id}` · `/{id}/url` | any | Catalog list (with filters), detail, presigned media URL |
 | `DELETE /api/assets/{id}` · `POST /api/assets/{id}/reindex` | admin | Remove everything for the asset / re-run ingestion |
@@ -194,7 +198,8 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 - **Roles.** `admin` can upload, delete, re-index and reset. `viewer` is read-only.
 - **Uploads.** Filenames are reduced to a safe basename stored under a per-asset UUID prefix.
   Uploads pass an extension allowlist and a magic-byte check, both at upload and again in the
-  worker, and size limits are enforced before and while reading.
+  worker, and size limits are enforced before and while reading. The worker verifies the stored
+  object's SHA-256 against the hash recorded at upload.
 - **Network.** CORS is limited to `CORS_ORIGINS`. Postgres and Redis aren't published to the host,
   and other ports bind to 127.0.0.1 by default. Redis requires a password. Containers run as a
   non-root user.
@@ -208,7 +213,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0
 pip install -r requirements/dev.txt
 ruff check . && ruff format --check .
-pytest --cov                          # 122 unit tests, no network, ~12 s
+pytest --cov                          # 134 unit tests, no network, ~12 s
 ./scripts/run-integration-tests.sh    # 9 integration tests against real Qdrant, Postgres and MinIO
 ```
 
@@ -235,7 +240,7 @@ pytest --cov                          # 122 unit tests, no network, ~12 s
   - Small vision models (moondream) sometimes describe details that aren't in the image.
 - **No OCR.** Scanned PDFs without a text layer are counted in `pages_without_text` but not
   indexed.
-- **Slow summaries for long documents.** A 100-page PDF takes about 3 minutes on CPU. With
+- **Slow summaries for long documents.** A 100-page PDF takes 3–6 minutes on CPU. With
   `OLLAMA_MAX_LOADED_MODELS=1`, the first caption after a RAG query also waits while Ollama
   swaps models.
 - **Streamlit holds UI uploads in memory**, hence the 200 MB UI cap. Use the direct uploader

@@ -57,7 +57,8 @@ class Api:
 
     def upload(self, path: Path) -> str:
         with path.open("rb") as fh:
-            res = self.client.post("/api/upload", headers=self.headers, files={"file": (path.name, fh)})
+            params = {} if self.flavor == "legacy" else {"allow_duplicate": "true"}
+            res = self.client.post("/api/upload", headers=self.headers, params=params, files={"file": (path.name, fh)})
         res.raise_for_status()
         return res.json()["task_id"]
 
@@ -244,7 +245,7 @@ def cmd_upload(api: Api, args) -> None:
         time.sleep(3)
     t0 = time.perf_counter()
     if args.direct:
-        asset = direct_upload(api.client, api.headers, path)
+        asset = direct_upload(api.client, api.headers, path, allow_duplicate=True)
         task_id = asset["task_id"]
     else:
         task_id = api.upload(path)

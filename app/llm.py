@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import math
 import random
 import re
 import time
@@ -166,7 +167,8 @@ def finalize_answer(answer: str, n_sources: int) -> tuple[str, list[int]]:
     text_only = re.sub(r"\[\d{1,2}\]", "", answer).strip(" .\n")
     if len(text_only) < 3 or text_only.lower().startswith("i don't know"):
         return NO_ANSWER, []
-    return answer, cited_numbers(answer, n_sources)
+    cited = cited_numbers(answer, n_sources)
+    return re.sub(r"^(\s*\[\d{1,2}\])+\s*", "", answer), cited  # drop citations before any text
 
 
 def cited_numbers(answer: str, n_sources: int) -> list[int]:
@@ -202,6 +204,20 @@ def pack_blocks(blocks: list[str], budget: int) -> list[list[str]]:
     return windows
 
 
+PARTIAL_CHARS_ESTIMATE = 1200  # a 300-token partial summary is roughly 1,000-1,200 characters
+
+
+def estimate_calls(total_chars: int, budget: int) -> int:
+    """Expected LLM calls for map-reduce over `total_chars`, used to show "call N of M" up front."""
+    calls, size, levels = 1, total_chars, 0
+    while size > budget and levels < 4:
+        windows = math.ceil(size / budget)
+        calls += windows
+        size = windows * PARTIAL_CHARS_ESTIMATE
+        levels += 1
+    return calls
+
+
 async def summarize_blocks(
     title: str,
     blocks: list[str],
@@ -216,7 +232,7 @@ async def summarize_blocks(
     `on_progress(done, planned)` is called after each LLM call."""
     budget = budget or config.LLM_CONTEXT_CHARS
     calls = 0
-    planned = 1
+    planned = estimate_calls(sum(len(b) + 1 for b in blocks), budget)
     level_blocks = blocks
     levels = 0
     semaphore = asyncio.Semaphore(max_parallel)
@@ -235,13 +251,15 @@ async def summarize_blocks(
 
     while sum(len(b) + 1 for b in level_blocks) > budget and levels < 4:
         windows = pack_blocks(level_blocks, budget)
-        planned += len(windows)
+        # Re-plan with the real window count; later levels are still estimated.
+        planned = calls + len(windows) + estimate_calls(len(windows) * PARTIAL_CHARS_ESTIMATE, budget)
         partials = await asyncio.gather(*(partial(w) for w in windows))
         level_blocks = [f"Part {i + 1} of {len(partials)}:\n{p}" for i, p in enumerate(partials)]
         levels += 1
 
     summary = await chat(SUMMARY_SYSTEM, f"Content of '{title}':\n" + "\n".join(level_blocks), max_tokens=700)
     calls += 1
+    planned = calls
     progressed()
     return {
         "summary": summary,

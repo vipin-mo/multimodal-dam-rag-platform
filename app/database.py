@@ -14,7 +14,7 @@ import uuid
 from datetime import UTC, datetime
 
 import bcrypt
-from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, ForeignKey, String, Text, create_engine
+from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, ForeignKey, String, Text, create_engine, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -64,6 +64,7 @@ class Asset(Base):
     media_type = Column(String(16), nullable=False, index=True)
     content_type = Column(String(64), nullable=False)
     size_bytes = Column(BigInteger, nullable=True)
+    sha256 = Column(String(64), nullable=True, index=True)  # content hash: dedup + integrity check
     # pending_upload -> queued -> processing -> ready | failed
     status = Column(String(16), nullable=False, default="queued", index=True)
     task_id = Column(String(64), nullable=True)
@@ -83,6 +84,7 @@ class Asset(Base):
             "media_type": self.media_type,
             "content_type": self.content_type,
             "size_bytes": self.size_bytes,
+            "sha256": self.sha256,
             "status": self.status,
             "task_id": self.task_id,
             "error": self.error,
@@ -142,10 +144,21 @@ def _seed_user(db: Session, username: str, password: str, role: str) -> None:
         db.rollback()
 
 
+def _upgrade_schema() -> None:
+    """In-place upgrades for databases created by earlier v2 builds (create_all never alters
+    existing tables). Idempotent. If the schema keeps evolving, this should become Alembic."""
+    if engine.dialect.name != "postgresql":
+        return
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sha256 VARCHAR(64)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_assets_sha256 ON assets (sha256)"))
+
+
 def init_db() -> None:
     """Creates tables and seeds accounts from ADMIN_* / VIEWER_* environment variables."""
     _wait_for_database()
     Base.metadata.create_all(bind=engine)
+    _upgrade_schema()
 
     with SessionLocal() as db:
         admin_user = os.getenv("ADMIN_USERNAME", "admin")

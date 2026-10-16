@@ -114,7 +114,10 @@ These ran on qwen2.5:1.5b on CPU, as background Celery tasks.
 | Asset | Strategy | LLM calls | Time |
 |---|---|---:|---:|
 | 10-min transcript (27 windows) | single pass | 1 | 5.7 s |
-| 100-page PDF (600 chunks) | map-reduce, 2 levels | 20 | 176 s |
+| 100-page PDF (600 chunks) | map-reduce, 2 levels | 20 | 176–374 s (two runs) |
+
+CPU-bound LLM time varies a lot with machine load: the slower run came after about two hours
+of continuous benchmarking.
 
 The first version ran map-reduce partials two at a time inside the HTTP request and took 404 s.
 The two concurrent calls only queued behind each other in Ollama, which serves one request at a
