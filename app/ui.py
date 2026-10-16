@@ -92,6 +92,12 @@ def location(hit: dict) -> str:
     return ""
 
 
+def where(hit: dict) -> str:
+    """' · page 3' / ' · 01:05', or nothing when a hit has no location (still images)."""
+    loc = location(hit)
+    return f" · {loc}" if loc else ""
+
+
 def open_player(hit: dict, slot: str) -> None:
     st.session_state[f"player-{slot}"] = {
         "asset_id": hit["asset_id"],
@@ -143,7 +149,7 @@ def jump_button(hit: dict, key: str, slot: str) -> None:
     st.button(label, key=key, on_click=open_player, args=(hit, slot))
 
 
-def wait_for_tasks(jobs: list[tuple[str, str]]) -> None:
+def wait_for_tasks(jobs: list[tuple[str, str]], tab: str) -> None:
     """Polls ingestion tasks and shows one progress bar per file."""
     bars = {task_id: (name, st.progress(0, text=f"{name}: queued")) for name, task_id in jobs}
     pending = set(bars)
@@ -170,9 +176,20 @@ def wait_for_tasks(jobs: list[tuple[str, str]]) -> None:
         if pending:
             time.sleep(1)
     if failed:
-        st.error(f"{failed} of {len(jobs)} file(s) failed to index.")
+        flash(tab, "error", f"{failed} of {len(jobs)} file(s) failed to index.")
     else:
-        st.success(f"Indexed {len(jobs)} file(s). They are now searchable.")
+        flash(tab, "success", f"Indexed {len(jobs)} file(s). They are now searchable.")
+    # Rerun so every tab (e.g. the Library list) reflects the new assets; the message survives via flash().
+    st.rerun()
+
+
+def flash(tab: str, level: str, message: str) -> None:
+    st.session_state.setdefault(f"flash-{tab}", []).append((level, message))
+
+
+def show_flash(tab: str) -> None:
+    for level, message in st.session_state.pop(f"flash-{tab}", []):
+        getattr(st, level)(message)
 
 
 def request_summary(asset_id: str) -> dict | None:
@@ -243,14 +260,21 @@ tabs = st.tabs(tab_names)
 
 # ====================================================================== search
 with tabs[0]:
+    # Widget values are already updated when the rerun starts, so a changed query clears the old
+    # player before it is drawn.
+    search_state = (
+        st.session_state.get("search_q", ""),
+        st.session_state.get("search_type"),
+        st.session_state.get("search_k"),
+    )
+    if st.session_state.get("last-search") != search_state:
+        st.session_state["last-search"] = search_state
+        st.session_state.pop("player-search", None)
     render_player("search")
     col_q, col_type, col_k = st.columns([5, 2, 1])
     query = col_q.text_input("Search across documents, transcripts, images and video frames", key="search_q")
     media_filter = col_type.selectbox("Type", ["all", "document", "image", "video", "audio"], key="search_type")
     limit = col_k.number_input("Results", 1, 20, 6, key="search_k")
-    if st.session_state.get("last-search") != (query, media_filter, limit):
-        st.session_state["last-search"] = (query, media_filter, limit)
-        st.session_state.pop("player-search", None)
     if query.strip():
         params = {"query": query, "limit": limit}
         if media_filter != "all":
@@ -266,7 +290,7 @@ with tabs[0]:
                 for i, hit in enumerate(results["text_matches"]):
                     with st.container(border=True):
                         st.markdown(
-                            f"{TYPE_ICONS.get(hit['media_type'], '')} **{hit['filename']}** · {location(hit)}"
+                            f"{TYPE_ICONS.get(hit['media_type'], '')} **{hit['filename']}**{where(hit)}"
                             f" · score {hit['score']:.2f}"
                         )
                         st.write(hit["text"])
@@ -279,7 +303,7 @@ with tabs[0]:
                 for i, hit in enumerate(results["visual_matches"]):
                     with st.container(border=True):
                         st.markdown(
-                            f"{TYPE_ICONS.get(hit['media_type'], '')} **{hit['filename']}** · {location(hit)}"
+                            f"{TYPE_ICONS.get(hit['media_type'], '')} **{hit['filename']}**{where(hit)}"
                             f" · score {hit['score']:.2f}"
                         )
                         if hit["media_type"] == "image" and (
@@ -326,6 +350,7 @@ with tabs[1]:
 
 # ====================================================================== library
 with tabs[2]:
+    show_flash("library")
     c1, c2 = st.columns([3, 1])
     lib_type = c1.selectbox("Filter", ["all", "document", "image", "video", "audio"], key="lib_type")
     if c2.button("Refresh", use_container_width=True):
@@ -359,8 +384,18 @@ with tabs[2]:
             use_container_width=True,
             hide_index=True,
         )
-        by_label = {f"{TYPE_ICONS.get(a['media_type'], '')} {a['filename']} ({a['id'][:8]})": a for a in assets}
-        asset = by_label[st.selectbox("Asset details", list(by_label))]
+        # Keep the selection by asset id: Streamlit resets a selectbox whose options change (e.g. a
+        # new upload appears), which would otherwise jump the details pane to another asset.
+        by_id = {a["id"]: a for a in assets}
+        previous = st.session_state.get("selected-asset")
+        chosen = st.selectbox(
+            "Asset details",
+            list(by_id),
+            index=list(by_id).index(previous) if previous in by_id else 0,
+            format_func=lambda i: f"{TYPE_ICONS.get(by_id[i]['media_type'], '')} {by_id[i]['filename']} ({i[:8]})",
+        )
+        st.session_state["selected-asset"] = chosen
+        asset = by_id[chosen]
 
         with st.container(border=True):
             info, preview = st.columns([1, 1])
@@ -401,7 +436,7 @@ with tabs[2]:
                 ):
                     try:
                         job = api("POST", f"/api/assets/{asset['id']}/reindex")
-                        wait_for_tasks([(asset["filename"], job["task_id"])])
+                        wait_for_tasks([(asset["filename"], job["task_id"])], tab="library")
                     except ApiError as exc:
                         st.error(str(exc))
                 if actions[2].button("Delete", use_container_width=True):
@@ -429,13 +464,17 @@ with tabs[2]:
 # ====================================================================== upload
 if is_admin:
     with tabs[3]:
+        show_flash("upload")
         st.markdown(
             f"Upload up to **{MAX_UPLOAD_MB} MB** per file here. For larger files use the direct uploader, "
             "which sends the file straight to object storage in parts:"
         )
         st.code("DAM_PASSWORD=... python scripts/dam_upload.py path/to/large_video.mp4", language="bash")
-        files = st.file_uploader("Files", type=UPLOAD_TYPES, accept_multiple_files=True)
+        # A new key per batch empties the picker once a batch is done, so files aren't sent twice.
+        batch = st.session_state.setdefault("upload-batch", 0)
+        files = st.file_uploader("Files", type=UPLOAD_TYPES, accept_multiple_files=True, key=f"uploader-{batch}")
         if files and st.button(f"Upload and index {len(files)} file(s)", type="primary"):
+            st.session_state["upload-batch"] = batch + 1
             jobs = []
             for f in files:
                 try:
@@ -443,8 +482,9 @@ if is_admin:
                     jobs.append((res["filename"], res["task_id"]))
                 except ApiError as exc:
                     if str(exc).startswith("409"):
-                        st.warning(f"{f.name}: skipped, {str(exc)[5:]}")
+                        flash("upload", "warning", f"{f.name}: skipped. {str(exc)[5:]}")
                     else:
-                        st.error(f"{f.name}: {exc}")
+                        flash("upload", "error", f"{f.name}: {exc}")
             if jobs:
-                wait_for_tasks(jobs)
+                wait_for_tasks(jobs, tab="upload")  # reruns when done
+            st.rerun()
