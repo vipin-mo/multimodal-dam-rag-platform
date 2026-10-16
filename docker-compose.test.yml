@@ -1,0 +1,35 @@
+# Throwaway services for the integration tests (scripts/run-integration-tests.sh, CI).
+# Credentials here are test-only and never used by the real stack.
+name: dam-test
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.8.0
+    ports: ["127.0.0.1:16333:6333"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
+      interval: 3s
+      retries: 30
+    tmpfs: [/qdrant/storage]
+
+  postgres:
+    image: postgres:15.10-alpine
+    environment: {POSTGRES_USER: dam, POSTGRES_PASSWORD: dam-test-only, POSTGRES_DB: dam}
+    ports: ["127.0.0.1:15432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dam -d dam"]
+      interval: 3s
+      retries: 30
+    tmpfs: [/var/lib/postgresql/data]
+
+  minio:
+    image: cgr.dev/chainguard/minio@sha256:2136d593beacf4461187035eca949fe49abd589d5079735025c711ca58fee0c8
+    command: ["server", "/data"]
+    user: "0"
+    environment: {MINIO_ROOT_USER: dam-test-access, MINIO_ROOT_PASSWORD: dam-test-only-secret}
+    ports: ["127.0.0.1:19000:9000"]
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
+      interval: 3s
+      retries: 30
+    tmpfs: [/data]
