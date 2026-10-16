@@ -166,8 +166,15 @@ def test_llm_retries_transient_failures(scripted_llm):
 
 def test_llm_gives_up_after_max_attempts(scripted_llm):
     with pytest.raises(llm.LLMUnavailable, match="4 attempts"):
-        scripted_llm(*[httpx.ReadTimeout("slow")] * 4)
+        scripted_llm(*[httpx.ConnectError("refused")] * 4)
     assert FakeAsyncClient.calls == llm.MAX_ATTEMPTS
+
+
+def test_llm_read_timeout_is_not_retried(scripted_llm):
+    """Ollama keeps generating for an abandoned request; retrying would only queue more work."""
+    with pytest.raises(llm.LLMUnavailable, match="did not finish"):
+        scripted_llm(httpx.ReadTimeout("slow"), _ok("never reached"))
+    assert FakeAsyncClient.calls == 1
 
 
 def test_llm_missing_model_fails_fast(scripted_llm):
@@ -178,8 +185,41 @@ def test_llm_missing_model_fails_fast(scripted_llm):
 
 def test_llm_payload_sets_context_window():
     payload = llm._payload("m", "s", "u", images=["b64"], max_tokens=10)
-    assert payload["options"] == {"temperature": 0.1, "num_ctx": config.OLLAMA_NUM_CTX, "num_predict": 10}
+    assert payload["options"]["num_ctx"] == config.OLLAMA_NUM_CTX
+    assert payload["options"]["num_predict"] == 10
+    assert llm._payload("m", "s", "u", None, None)["options"]["num_predict"] == llm.DEFAULT_MAX_TOKENS
     assert payload["messages"][1]["images"] == ["b64"]
+
+
+def test_vision_payload_has_no_system_turn():
+    assert [m["role"] for m in llm._payload("m", None, "u", ["img"], None)["messages"]] == ["user"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "trimmed"),
+    [
+        ("A red square. It sits on a white", "A red square."),
+        ("Complete sentence.", "Complete sentence."),
+        ("no punctuation at all", "no punctuation at all"),
+        ("  Spaced\n out.  Next one cut", "Spaced out."),
+    ],
+)
+def test_trim_to_sentence(raw, trimmed):
+    assert llm.trim_to_sentence(raw) == trimmed
+
+
+@pytest.mark.parametrize(
+    ("raw", "answer", "cited"),
+    [
+        ("Due December 15 [1].", "Due December 15 [1].", [1]),
+        ("[1]", llm.NO_ANSWER, []),
+        ("  [2] .", llm.NO_ANSWER, []),
+        ("I don't know.", llm.NO_ANSWER, []),
+        ("Plain answer without citations.", "Plain answer without citations.", []),
+    ],
+)
+def test_finalize_answer(raw, answer, cited):
+    assert llm.finalize_answer(raw, n_sources=3) == (answer, cited)
 
 
 def test_cited_numbers():

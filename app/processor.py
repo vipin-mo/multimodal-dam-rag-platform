@@ -4,6 +4,7 @@ One task per asset, addressed by asset id. Re-running a task is safe: existing v
 asset are deleted first and point ids are deterministic.
 """
 
+import asyncio
 import base64
 import contextlib
 import io
@@ -20,11 +21,12 @@ from celery import Celery
 from celery.signals import worker_process_init
 from qdrant_client.http import models as qm
 
-from app import config, embeddings, llm, media, storage, vectors
+from app import config, embeddings, llm, media, storage, summaries, vectors
 from app.chunking import chunk_text, window_segments
 from app.database import Asset, SessionLocal, update_asset
 
 logger = logging.getLogger("dam.worker")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 celery_app = Celery("dam-worker", broker=config.celery_broker_url(), backend=config.CELERY_RESULT_BACKEND)
 celery_app.conf.update(
@@ -36,6 +38,7 @@ celery_app.conf.update(
     worker_max_tasks_per_child=50,
     task_time_limit=3 * 3600,
     result_expires=7 * 24 * 3600,
+    task_routes={"dam.summarize_asset": {"queue": config.LLM_QUEUE}},
 )
 
 
@@ -142,6 +145,29 @@ def ingest_asset(self, asset_id: str) -> dict:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+@celery_app.task(bind=True, name="dam.summarize_asset")
+def summarize_asset(self, asset_id: str) -> dict:
+    """Generates and caches an asset summary (consumed by the llm-worker service)."""
+    with SessionLocal() as db:
+        asset = db.get(Asset, asset_id)
+        if asset is None:
+            raise LookupError("Asset no longer exists.")
+        args = (asset.id, asset.filename, asset.media_type, asset.object_key)
+
+    shown = 1
+
+    def report(done: int, planned: int) -> None:
+        nonlocal shown  # map-reduce can add a level mid-way; never let the bar move backwards
+        shown = max(shown, int(100 * done / max(planned, 1)) - 1)
+        self.update_state(state="PROGRESS", meta={"progress": shown, "stage": f"LLM call {done + 1} of {planned}"})
+
+    self.update_state(state="PROGRESS", meta={"progress": 1, "stage": "summarizing"})
+    result = asyncio.run(summaries.summarize(*args, on_progress=report))
+    with contextlib.suppress(LookupError):
+        update_asset(asset_id, summary=result)
+    return {"asset_id": asset_id, **result}
+
+
 # ====================================================================== documents
 def process_document(job: Job) -> dict:
     from pypdf import PdfReader
@@ -191,16 +217,16 @@ def _jpeg_b64(image, max_side: int = 1024) -> str:
 def caption_image(image) -> str | None:
     """Short VLM description, indexed as text so images are reachable from text search and RAG."""
     try:
-        return llm.chat_sync(
-            "You describe images for a search index.",
-            llm.CAPTION_PROMPT,
-            model=config.OLLAMA_VISION_MODEL,
-            images=[_jpeg_b64(image)],
-            max_tokens=160,
+        text = llm.chat_sync(
+            None, llm.CAPTION_PROMPT, model=config.OLLAMA_VISION_MODEL, images=[_jpeg_b64(image)], max_tokens=160
         )
     except Exception as exc:  # noqa: BLE001 - captions are best-effort
         logger.warning("Captioning skipped: %s", exc)
         return None
+    if not text.strip():
+        logger.warning("Vision model %s returned an empty caption", config.OLLAMA_VISION_MODEL)
+        return None
+    return llm.trim_to_sentence(text)
 
 
 def process_image(job: Job) -> dict:

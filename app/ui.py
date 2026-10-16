@@ -57,6 +57,22 @@ def fmt_ts(seconds) -> str:
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
+INDEX_LABELS = {
+    "chunks_indexed": ("text chunk", "text chunks"),
+    "transcript_windows": ("transcript window", "transcript windows"),
+    "frames_indexed": ("frame", "frames"),
+    "image_vectors": ("image vector", "image vectors"),
+}
+
+
+def indexed_summary(stats: dict) -> str:
+    parts = []
+    for key, (one, many) in INDEX_LABELS.items():
+        if key in stats:
+            parts.append(f"{stats[key]} {one if stats[key] == 1 else many}")
+    return ", ".join(parts)
+
+
 def fmt_size(n) -> str:
     n = float(n or 0)
     for unit in ("B", "KB", "MB", "GB"):
@@ -76,54 +92,62 @@ def location(hit: dict) -> str:
     return ""
 
 
-def open_player(hit: dict) -> None:
-    st.session_state["player"] = {
+def open_player(hit: dict, slot: str) -> None:
+    st.session_state[f"player-{slot}"] = {
         "asset_id": hit["asset_id"],
         "filename": hit["filename"],
         "media_type": hit["media_type"],
+        "kind": hit.get("kind"),
         "start": hit.get("start") or 0,
         "page": hit.get("page"),
+        "text": hit.get("text"),
     }
 
 
-def render_player(slot_key: str) -> None:
-    """Shows the selected search hit or citation at its page/timestamp."""
-    player = st.session_state.get("player")
+def render_player(slot: str) -> None:
+    """Shows the selected search hit or citation at its page/timestamp (one player per tab)."""
+    player = st.session_state.get(f"player-{slot}")
     if not player:
         return
     url = media_url(player["asset_id"], st.session_state["token"])
     with st.container(border=True):
-        head, close = st.columns([6, 1])
-        head.markdown(f"**{TYPE_ICONS.get(player['media_type'], '')} {player['filename']}** · {location(player)}")
-        if close.button("Close", key=f"close-{slot_key}"):
-            st.session_state.pop("player")
-            st.rerun()
-        if not url:
-            st.warning("Could not get a media link.")
-        elif player["media_type"] == "video":
-            st.video(url, start_time=int(player["start"]))
-        elif player["media_type"] == "audio":
-            st.audio(url, start_time=int(player["start"]))
-        elif player["media_type"] == "image":
-            st.image(url, use_column_width=True)
-        else:
-            page = player.get("page") or 1
-            st.link_button(f"Open PDF at page {page}", f"{url}#page={page}")
+        media_col, info_col = st.columns([3, 2])
+        with media_col:
+            if not url:
+                st.warning("Could not get a media link.")
+            elif player["media_type"] == "video":
+                st.video(url, start_time=int(player["start"]))
+            elif player["media_type"] == "audio":
+                st.audio(url, start_time=int(player["start"]))
+            elif player["media_type"] == "image":
+                st.image(url, use_column_width=True)
+            else:
+                page = player.get("page") or 1
+                st.link_button(f"Open PDF at page {page}", f"{url}#page={page}")
+        with info_col:
+            st.markdown(f"**{TYPE_ICONS.get(player['media_type'], '')} {player['filename']}**")
+            st.caption(location(player))
+            if player.get("text"):
+                st.write(player["text"])
+            if st.button("Close player", key=f"close-{slot}"):
+                st.session_state.pop(f"player-{slot}")
+                st.rerun()
 
 
-def jump_button(hit: dict, key: str) -> None:
+def jump_button(hit: dict, key: str, slot: str) -> None:
     label = {"video": "▶ Play", "audio": "▶ Play", "image": "🖼 View", "document": "📄 Open"}[hit["media_type"]]
     if hit.get("start") is not None and hit["media_type"] in ("video", "audio"):
         label += f" at {fmt_ts(hit['start'])}"
     elif hit.get("page") is not None:
         label += f" page {hit['page']}"
-    st.button(label, key=key, on_click=open_player, args=(hit,))
+    st.button(label, key=key, on_click=open_player, args=(hit, slot))
 
 
 def wait_for_tasks(jobs: list[tuple[str, str]]) -> None:
     """Polls ingestion tasks and shows one progress bar per file."""
     bars = {task_id: (name, st.progress(0, text=f"{name}: queued")) for name, task_id in jobs}
     pending = set(bars)
+    failed = 0
     while pending:
         for task_id in list(pending):
             name, bar = bars[task_id]
@@ -140,10 +164,34 @@ def wait_for_tasks(jobs: list[tuple[str, str]]) -> None:
             elif state == "FAILURE":
                 bar.progress(100, text=f"❌ {name}: {status.get('result')}")
                 pending.discard(task_id)
+                failed += 1
             else:
                 bar.progress(int(status.get("progress") or 0), text=f"{name}: {stage or state.lower()}")
         if pending:
             time.sleep(1)
+    if failed:
+        st.error(f"{failed} of {len(jobs)} file(s) failed to index.")
+    else:
+        st.success(f"Indexed {len(jobs)} file(s). They are now searchable.")
+
+
+def request_summary(asset_id: str) -> dict | None:
+    """Cached summaries come back immediately (200); otherwise the LLM worker runs it (202) and
+    we poll the task. Long documents are summarized in parts, then combined."""
+    res = api("POST", f"/api/assets/{asset_id}/summary")
+    if "task_id" not in res:
+        return res
+    bar = st.progress(0, text="Summary queued on the LLM worker...")
+    while True:
+        status = api("GET", f"/api/tasks/{res['task_id']}", timeout=10)
+        if status["state"] == "SUCCESS":
+            bar.empty()
+            return {**status["result"], "cached": False}
+        if status["state"] == "FAILURE":
+            bar.empty()
+            raise ApiError(f"Summary failed: {status['result']}")
+        bar.progress(max(1, int(status.get("progress") or 0)), text=status.get("stage") or "waiting for the LLM worker")
+        time.sleep(1.5)
 
 
 # ====================================================================== login
@@ -200,6 +248,9 @@ with tabs[0]:
     query = col_q.text_input("Search across documents, transcripts, images and video frames", key="search_q")
     media_filter = col_type.selectbox("Type", ["all", "document", "image", "video", "audio"], key="search_type")
     limit = col_k.number_input("Results", 1, 20, 6, key="search_k")
+    if st.session_state.get("last-search") != (query, media_filter, limit):
+        st.session_state["last-search"] = (query, media_filter, limit)
+        st.session_state.pop("player-search", None)
     if query.strip():
         params = {"query": query, "limit": limit}
         if media_filter != "all":
@@ -219,7 +270,7 @@ with tabs[0]:
                             f" · score {hit['score']:.2f}"
                         )
                         st.write(hit["text"])
-                        jump_button(hit, key=f"t{i}")
+                        jump_button(hit, key=f"t{i}", slot="search")
                 if not results["text_matches"]:
                     st.caption("No text matches.")
             with right:
@@ -235,7 +286,7 @@ with tabs[0]:
                             url := media_url(hit["asset_id"], st.session_state["token"])
                         ):
                             st.image(url, width=280)
-                        jump_button(hit, key=f"v{i}")
+                        jump_button(hit, key=f"v{i}", slot="search")
                 if not results["visual_matches"]:
                     st.caption("No visual matches.")
         except ApiError as exc:
@@ -258,6 +309,7 @@ with tabs[1]:
         with st.spinner("Retrieving sources and generating an answer..."):
             try:
                 st.session_state["rag"] = api("POST", "/api/rag", json=body, timeout=240)
+                st.session_state.pop("player-ask", None)
             except ApiError as exc:
                 st.error(str(exc))
     if rag := st.session_state.get("rag"):
@@ -270,7 +322,7 @@ with tabs[1]:
                 with st.container(border=True):
                     st.markdown(f"**[{src['n']}] {src['label']}** · score {src['score']:.2f} · {cited}")
                     st.caption(src["text"])
-                    jump_button(src, key=f"src{src['n']}")
+                    jump_button(src, key=f"src{src['n']}", slot="ask")
 
 # ====================================================================== library
 with tabs[2]:
@@ -296,11 +348,7 @@ with tabs[2]:
                     "status": a["status"],
                     "size": fmt_size(a["size_bytes"]),
                     "duration": fmt_ts(a["duration_seconds"]) if a["duration_seconds"] else "",
-                    "indexed": ", ".join(
-                        f"{v} {k.replace('_indexed', '').replace('_', ' ')}"
-                        for k, v in (a["stats"] or {}).items()
-                        if k in ("chunks_indexed", "frames_indexed", "transcript_windows", "image_vectors")
-                    ),
+                    "indexed": indexed_summary(a["stats"] or {}),
                     "processing": f"{a['stats']['processing_seconds']}s"
                     if a["stats"].get("processing_seconds")
                     else "",
@@ -343,11 +391,10 @@ with tabs[2]:
             actions = st.columns(3 if is_admin else 1)
             summary_key = f"summary-{asset['id']}"
             if actions[0].button("Summarize", disabled=asset["status"] != "ready", use_container_width=True):
-                with st.spinner("Summarizing (long assets are summarized in parts, then combined)..."):
-                    try:
-                        st.session_state[summary_key] = api("POST", f"/api/assets/{asset['id']}/summary", timeout=600)
-                    except ApiError as exc:
-                        st.error(str(exc))
+                try:
+                    st.session_state[summary_key] = request_summary(asset["id"])
+                except ApiError as exc:
+                    st.error(str(exc))
             if is_admin:
                 if actions[1].button(
                     "Re-index", use_container_width=True, disabled=asset["status"] not in ("ready", "failed")

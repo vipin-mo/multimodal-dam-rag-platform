@@ -45,6 +45,7 @@ QDRANT_PORT = _int("QDRANT_PORT", 6333)
 # Messaging
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://redis-cache:6379/0")
 INGESTION_QUEUE = os.getenv("INGESTION_QUEUE", "ingestion")
+LLM_QUEUE = os.getenv("LLM_QUEUE", "llm")  # summaries: long LLM jobs, separate from ingestion
 
 # LLM / VLM runtime
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://ollama-engine:11434")

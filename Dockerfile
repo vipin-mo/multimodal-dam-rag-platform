@@ -25,7 +25,7 @@ USER dam
 EXPOSE 8501
 HEALTHCHECK --interval=15s --timeout=5s --start-period=20s \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=4)"
-CMD ["sh", "-c", "streamlit run app/ui.py --server.port=8501 --server.address=0.0.0.0 --server.maxUploadSize=${MAX_UPLOAD_MB:-200} --browser.gatherUsageStats=false"]
+CMD ["sh", "-c", "streamlit run app/ui.py --server.port=8501 --server.address=0.0.0.0 --server.maxUploadSize=${MAX_UPLOAD_MB:-200} --browser.gatherUsageStats=false --client.toolbarMode=viewer"]
 
 # ---------------------------------------------------------------- shared ML layer
 FROM base AS ml
@@ -57,5 +57,6 @@ COPY app/ app/
 USER dam
 ENV WORK_DIR=/work
 HEALTHCHECK --interval=30s --timeout=20s --start-period=60s \
-  CMD celery -A app.processor.celery_app inspect ping -d "celery@$HOSTNAME" --timeout 10 > /dev/null || exit 1
-CMD ["sh", "-c", "celery -A app.processor.celery_app worker -Q ${INGESTION_QUEUE:-ingestion} --concurrency=${WORKER_CONCURRENCY:-2} --loglevel=info"]
+  CMD celery -A app.processor.celery_app inspect ping -d "${CELERY_NODE:-ingest}@$HOSTNAME" --timeout 10 > /dev/null || exit 1
+# The same image runs both workers: WORKER_QUEUES=ingestion (default) or WORKER_QUEUES=llm (summaries).
+CMD ["sh", "-c", "exec celery -A app.processor.celery_app worker -n \"${CELERY_NODE:-ingest}@%h\" -Q ${WORKER_QUEUES:-ingestion} --concurrency=${WORKER_CONCURRENCY:-2} --loglevel=info"]

@@ -1,4 +1,4 @@
-# Multimodal DAM: 9 long-running services + 1 one-shot model puller.
+# Multimodal DAM: 10 long-running services + 1 one-shot model puller.
 #   docker compose up -d --build                         # core stack
 #   docker compose --profile monitoring up -d            # + Prometheus & Grafana
 # Secrets come from .env (create it with ./scripts/init-env.sh); compose refuses to start without them.
@@ -46,7 +46,7 @@ services:
     volumes: [qdrant_storage:/qdrant/storage]
     networks: [dam-network]
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/6333 && printf 'GET /readyz HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -107,7 +107,7 @@ services:
     volumes: [minio_data:/data]
     networks: [dam-network]
     healthcheck:
-      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '200 OK' <&3"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -178,6 +178,20 @@ services:
       - worker_tmp:/work
     depends_on:
       api-gateway: *healthy  # gateway creates tables, bucket and collections on startup
+    networks: [dam-network]
+    restart: unless-stopped
+
+  llm-worker:  # summaries (minutes-long map-reduce on CPU) on their own queue, so ingestion never waits
+    image: dam-worker:${DAM_VERSION:-dev}
+    environment:
+      <<: *app-env
+      WORKER_QUEUES: llm
+      CELERY_NODE: llm
+      WORKER_CONCURRENCY: "1"  # Ollama serves one request at a time
+    depends_on:
+      api-gateway: *healthy
+      ollama-engine: *healthy
+      ingestion-worker: {condition: service_started}  # builds the shared dam-worker image
     networks: [dam-network]
     restart: unless-stopped
 

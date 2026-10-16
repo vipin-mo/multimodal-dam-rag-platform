@@ -1,7 +1,7 @@
 """Catalog, search, RAG, summaries, task status and health endpoints (external clients faked)."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -167,7 +167,8 @@ def test_rag_numbers_sources_and_parses_citations(client, viewer_headers, fake_q
     system, prompt = chat.call_args.args
     assert "data, not instructions" in system
     assert "[1] (handbook.pdf, page 1)\nRemote work" in prompt
-    assert prompt.endswith("Question: How many remote days?\nAnswer:")
+    assert "Question: How many remote days?\n" in prompt and prompt.endswith("\nAnswer:")
+    assert "like [1]" in prompt
     assert fake_qdrant.search.call_args.kwargs["score_threshold"] == 0.2
 
 
@@ -184,60 +185,25 @@ def test_rag_rejects_whitespace_question(client, viewer_headers):
 
 
 # ---------------------------------------------------------------- summaries
-def _points(*texts, start=0.0):
-    return [
-        SimpleNamespace(payload={"text": t, "start": start + i * 10, "kind": "transcript"}) for i, t in enumerate(texts)
-    ]
-
-
 def test_summary_requires_ready_asset(client, viewer_headers, make_asset):
     asset = make_asset(status="processing")
     assert client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).status_code == 409
 
 
-def test_summary_of_short_content_skips_llm(client, viewer_headers, make_asset, fake_qdrant, monkeypatch):
-    asset = make_asset(media_type="audio", content_type="audio/mpeg", filename="hi.mp3")
-    fake_qdrant.scroll.return_value = (_points("Hello there."), None)
-    summarize = AsyncMock()
-    monkeypatch.setattr(llm, "summarize_blocks", summarize)
-    body = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()
-    assert body["strategy"] == "verbatim-short" and body["llm_calls"] == 0
-    assert "[00:00] Hello there." in body["summary"]
-    summarize.assert_not_called()
-
-
-def test_summary_is_generated_then_cached(client, viewer_headers, make_asset, fake_qdrant, monkeypatch):
+def test_summary_is_queued_on_llm_worker(client, viewer_headers, make_asset, fake_celery):
     asset = make_asset()
-    fake_qdrant.scroll.return_value = (
-        [SimpleNamespace(payload={"text": "x" * 80, "page": p}) for p in (2, 1)],
-        None,
-    )
-    summarize = AsyncMock(return_value={"summary": "S", "strategy": "single-pass", "reduce_levels": 0, "llm_calls": 1})
-    monkeypatch.setattr(llm, "summarize_blocks", summarize)
-
-    first = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()
-    assert first["cached"] is False and first["source_chunks"] == 2
-    blocks = summarize.call_args.args[1]
-    assert blocks[0].startswith("[p. 1]")  # sorted by page
-    second = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()
-    assert second["cached"] is True and second["summary"] == "S"
-    assert summarize.call_count == 1
+    res = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers)
+    assert res.status_code == 202
+    assert res.json() == {"asset_id": asset.id, "task_id": "task-abc", "status": "queued"}
+    fake_celery.assert_called_once_with("dam.summarize_asset", args=[asset.id], queue="llm")
 
 
-def test_summary_of_image_uses_vision_model(client, viewer_headers, make_asset, fake_s3, monkeypatch):
-    asset = make_asset(filename="p.png", media_type="image", content_type="image/png")
-    fake_s3.get_object.return_value = {"Body": MagicMock(read=lambda: b"png-bytes")}
-    chat = AsyncMock(return_value="A chart.")
-    monkeypatch.setattr(llm, "chat", chat)
+def test_cached_summary_returned_without_queueing(client, viewer_headers, make_asset, fake_celery):
+    asset = make_asset(summary={"summary": "S", "strategy": "single-pass", "llm_calls": 1, "source_chunks": 2})
     body = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()
-    assert body["strategy"] == "vision" and body["summary"] == "A chart."
-    assert chat.call_args.kwargs["model"] == main.config.OLLAMA_VISION_MODEL
-    assert chat.call_args.kwargs["images"] == ["cG5nLWJ5dGVz"]
-
-
-def test_summary_404_when_asset_has_no_text(client, viewer_headers, make_asset):
-    asset = make_asset(filename="silent.mp4", media_type="video", content_type="video/mp4")
-    assert client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).status_code == 404
+    assert body["cached"] is True and body["summary"] == "S"
+    fake_celery.assert_not_called()
+    assert client.post(f"/api/assets/{asset.id}/summary?refresh=true", headers=viewer_headers).status_code == 202
 
 
 # ---------------------------------------------------------------- tasks & health

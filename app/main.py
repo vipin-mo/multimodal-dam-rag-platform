@@ -1,7 +1,6 @@
 """API gateway: auth, uploads, asset catalog, search, RAG and summaries."""
 
 import asyncio
-import base64
 import logging
 import re
 import uuid
@@ -30,6 +29,7 @@ from app.security import authenticate, create_access_token, require_admin, requi
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("dam.gateway")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # qdrant-client logs every request at INFO
 
 MAX_UPLOAD_BYTES = config.MAX_UPLOAD_MB * 2**20
 MAX_DIRECT_UPLOAD_BYTES = config.MAX_DIRECT_UPLOAD_MB * 2**20
@@ -515,63 +515,22 @@ async def rag(req: RagRequest, _: User = Depends(require_user)):
         answer = await llm.chat(llm.RAG_SYSTEM, llm.build_rag_prompt(q, sources))
     except llm.LLMUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-    return {"question": q, "answer": answer, "sources": sources, "cited": llm.cited_numbers(answer, len(sources))}
+    answer, cited = llm.finalize_answer(answer, len(sources))
+    return {"question": q, "answer": answer, "sources": sources, "cited": cited}
 
 
 @app.post("/api/assets/{asset_id}/summary")
-async def summarize_asset(
+def summarize_asset(
     refresh: bool = False,
     _: User = Depends(require_user),
     asset: Asset = Depends(get_asset),
-    db: Session = Depends(get_db),
 ):
-    """Summary of one asset. Images go to the vision model; everything else is summarized from its
-    indexed text, in one prompt if it fits the context budget, otherwise map-reduce. Results are cached."""
+    """Returns the cached summary (200), or queues one on the LLM worker and returns its task (202).
+    Long documents are map-reduced over many LLM calls, which can take minutes on CPU, so the work
+    never runs inside the request. Poll /api/tasks/{task_id}; the result holds the summary."""
     if asset.status != "ready":
         raise HTTPException(status_code=409, detail=f"Asset is {asset.status}; summaries need a ready asset.")
     if asset.summary and not refresh:
         return {"asset_id": asset.id, "filename": asset.filename, "cached": True, **asset.summary}
-
-    try:
-        if asset.media_type == "image":
-            body = await run_in_threadpool(
-                lambda: storage.s3.get_object(Bucket=storage.BUCKET, Key=asset.object_key)["Body"].read()
-            )
-            report = await llm.chat(
-                "You are a careful visual analyst.",
-                llm.IMAGE_REPORT_PROMPT,
-                model=config.OLLAMA_VISION_MODEL,
-                images=[base64.b64encode(body).decode()],
-            )
-            result = {"summary": report, "strategy": "vision", "llm_calls": 1, "source_chunks": 0}
-        else:
-            points = await run_in_threadpool(lambda: list(vectors.iter_asset_points(vectors.TEXT, asset.id)))
-            if not points:
-                raise HTTPException(
-                    status_code=404, detail="This asset has no extracted text (no speech or text layer)."
-                )
-            points.sort(key=lambda p: (p.payload.get("page") or 0, p.payload.get("start") or 0.0))
-            blocks = []
-            for p in points:
-                where = (
-                    f"p. {p.payload['page']}" if p.payload.get("page") is not None else fmt_ts(p.payload.get("start"))
-                )
-                blocks.append(f"[{where}] {p.payload.get('text', '').strip()}")
-            text_chars = sum(len(p.payload.get("text", "")) for p in points)
-            if text_chars < 100:
-                # Too little content for a meaningful summary: return it verbatim without an LLM call.
-                result = {
-                    "summary": "\n".join(blocks),
-                    "strategy": "verbatim-short",
-                    "llm_calls": 0,
-                    "source_chunks": len(points),
-                }
-            else:
-                result = await llm.summarize_blocks(asset.filename, blocks)
-                result["source_chunks"] = len(points)
-    except llm.LLMUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
-    asset.summary = result
-    await run_in_threadpool(db.commit)
-    return {"asset_id": asset.id, "filename": asset.filename, "cached": False, **result}
+    task = celery_client.send_task("dam.summarize_asset", args=[asset.id], queue=config.LLM_QUEUE)
+    return JSONResponse(status_code=202, content={"asset_id": asset.id, "task_id": task.id, "status": "queued"})

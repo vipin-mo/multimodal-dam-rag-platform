@@ -1,2 +1,6 @@
 streamlit==1.32.2
 requests==2.31.0
+# Pinned so the resolver can't pick a pyarrow that needs NumPy 2 (Streamlit 1.32 requires NumPy < 2).
+numpy==1.26.4
+pandas==2.2.3
+pyarrow==17.0.0
