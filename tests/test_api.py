@@ -151,7 +151,9 @@ def test_visual_results_keep_one_frame_per_video_moment(client, viewer_headers, 
     fake_qdrant.search.side_effect = lambda collection, **kw: frames if collection == "image_features" else []
     body = client.get("/api/search", headers=viewer_headers, params={"query": "scene", "limit": 5}).json()
     assert [(m["asset_id"], m["start"]) for m in body["visual_matches"]] == [("v1", 14), ("v2", 3), ("v1", 40)]
-    assert fake_qdrant.search.call_args_list[-1].kwargs["limit"] == 20  # over-fetched
+    # Text and image searches run concurrently, so call order varies: pick the image call explicitly.
+    image_call = next(c for c in fake_qdrant.search.call_args_list if c.args[0] == "image_features")
+    assert image_call.kwargs["limit"] == 20  # over-fetched
 
 
 def test_diversify_keeps_one_point_per_still_image():
