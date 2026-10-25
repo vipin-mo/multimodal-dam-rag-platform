@@ -578,12 +578,16 @@ async def rag(req: RagRequest, _: User = Depends(require_user)):
 @app.post("/api/assets/{asset_id}/summary")
 def summarize_asset(
     refresh: bool = False,
-    _: User = Depends(require_user),
+    user: User = Depends(require_user),
     asset: Asset = Depends(get_asset),
 ):
     """Returns the cached summary (200), or queues one on the LLM worker and returns its task (202).
     Long documents are map-reduced over many LLM calls, which can take minutes on CPU, so the work
-    never runs inside the request. Poll /api/tasks/{task_id}; the result holds the summary."""
+    never runs inside the request. Poll /api/tasks/{task_id}; the result holds the summary.
+    Any user can request a summary that doesn't exist yet; replacing a cached one (refresh=true)
+    is admin-only, because it discards stored output and costs minutes of LLM time."""
+    if refresh and user.role != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can regenerate a summary.")
     if asset.status != "ready":
         raise HTTPException(status_code=409, detail=f"Asset is {asset.status}; summaries need a ready asset.")
     if asset.summary and not refresh:

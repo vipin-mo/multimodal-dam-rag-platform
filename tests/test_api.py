@@ -234,12 +234,21 @@ def test_summary_is_queued_on_llm_worker(client, viewer_headers, make_asset, fak
     fake_celery.assert_called_once_with("dam.summarize_asset", args=[asset.id], queue="llm")
 
 
-def test_cached_summary_returned_without_queueing(client, viewer_headers, make_asset, fake_celery):
+def test_only_admins_can_force_a_summary_refresh(client, viewer_headers, admin_headers, make_asset, fake_celery):
+    asset = make_asset(summary={"summary": "S", "strategy": "single-pass", "llm_calls": 1, "source_chunks": 2})
+    res = client.post(f"/api/assets/{asset.id}/summary?refresh=true", headers=viewer_headers)
+    assert res.status_code == 403
+    fake_celery.assert_not_called()
+    assert client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()["cached"] is True
+    assert client.post(f"/api/assets/{asset.id}/summary?refresh=true", headers=admin_headers).status_code == 202
+
+
+def test_cached_summary_returned_without_queueing(client, viewer_headers, admin_headers, make_asset, fake_celery):
     asset = make_asset(summary={"summary": "S", "strategy": "single-pass", "llm_calls": 1, "source_chunks": 2})
     body = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()
     assert body["cached"] is True and body["summary"] == "S"
     fake_celery.assert_not_called()
-    assert client.post(f"/api/assets/{asset.id}/summary?refresh=true", headers=viewer_headers).status_code == 202
+    assert client.post(f"/api/assets/{asset.id}/summary?refresh=true", headers=admin_headers).status_code == 202
 
 
 # ---------------------------------------------------------------- tasks & health

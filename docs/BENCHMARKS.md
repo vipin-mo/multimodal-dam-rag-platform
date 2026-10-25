@@ -98,6 +98,8 @@ The test file is 1.02 GB. Peak memory was sampled with `docker stats` during the
 
 ## Images
 
+*Measured manually with `docker images` (not recorded in `results.jsonl`).*
+
 | Image | v1 | v2 |
 |---|---:|---:|
 | API gateway | 11.7 GB | 2.04 GB |
@@ -110,7 +112,8 @@ index and builds three targets from one multi-stage Dockerfile.
 
 ## Summaries (LLM worker)
 
-These ran on qwen2.5:1.5b on CPU, as background Celery tasks.
+These ran on qwen2.5:1.5b on CPU, as background Celery tasks. *Measured manually* by timing the
+summary task from the API (not recorded in `results.jsonl`).
 
 | Asset | Strategy | LLM calls | Time |
 |---|---|---:|---:|

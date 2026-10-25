@@ -1,5 +1,7 @@
 # Multimodal Digital Asset Management & RAG Platform
 
+[![CI](https://github.com/vipin-mo/multimodal-dam-rag-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/vipin-mo/multimodal-dam-rag-platform/actions/workflows/ci.yml)
+
 Upload PDFs, images, audio and video. The platform extracts text, transcribes speech and samples
 video frames, then indexes everything for semantic search. Search results open the media at the
 matching timestamp or page. You can also ask questions and get answers from a local LLM, with
@@ -22,7 +24,7 @@ by profiling v1. Both were measured with the same benchmark script. See
 | Retrieval recall@5 / MRR, 22 questions with distractors | 0.864 / 0.723 | **0.955 / 0.932** |
 | Search throughput at 8 concurrent clients | 15 req/s | **30 req/s** |
 | Gateway memory growth during a 1 GB upload | +56 MiB (through the API) | **+0 MiB** (direct to storage) |
-| Image size: API / worker / UI | 11.7 GB each | **2.0 / 2.4 / 0.8 GB** |
+| Image size: API / worker / UI (measured manually) | 11.7 GB each | **2.0 / 2.4 / 0.8 GB** |
 
 ## Project history
 
@@ -151,7 +153,7 @@ You need Docker with about 8 GB of memory (about 12 GB with the default `llava:7
 ```bash
 git clone https://github.com/vipin-mo/multimodal-dam-rag-platform.git
 cd multimodal-dam-rag-platform
-./scripts/init-env.sh            # writes .env with random secrets and prints the admin login
+./scripts/init-env.sh            # writes .env with random secrets; prints the admin and viewer logins
 docker compose up -d --build     # first start pulls about 6 GB of models
 ```
 
@@ -203,7 +205,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 | `DELETE /api/assets/{id}` · `POST /api/assets/{id}/reindex` | admin | Remove everything for the asset / re-run ingestion |
 | `GET /api/search?query=&media_type=&asset_id=&limit=` | any | Text and visual search in one call |
 | `POST /api/rag` | any | `{question, top_k, media_type?}`; returns the answer, numbered sources and cited numbers |
-| `POST /api/assets/{id}/summary` | any | `200` with the cached summary, or `202` with a task ID |
+| `POST /api/assets/{id}/summary` | any | `200` with the cached summary, or `202` with a task ID; `?refresh=true` is admin-only |
 | `GET /api/tasks/{task_id}` | any | `PENDING` / `PROGRESS` (percent and stage) / `SUCCESS` / `FAILURE` |
 | `POST /api/admin/reset` | admin | Deletes all objects, vectors and catalog entries |
 | `GET /health` · `GET /ready` · `GET /metrics` | – | Liveness, readiness, Prometheus metrics |
@@ -216,14 +218,17 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
   `docker compose exec api-gateway python -m app.database create-user <name> --role viewer`.
 - **Auth.** JWTs are HS256 with a secret of at least 32 characters and are accepted only in the
   `Authorization` header. Roles are re-read from the database on every request.
-- **Roles.** `admin` can upload, delete, re-index and reset. `viewer` is read-only.
+- **Roles.** `admin` can upload, delete, re-index, reset and regenerate summaries. `viewer` can
+  search, ask questions and read summaries (or request one that doesn't exist yet), but can't change
+  the library. `init-env.sh` creates both accounts; pass `--no-viewer` to create only the admin.
 - **Uploads.** Filenames are reduced to a safe basename stored under a per-asset UUID prefix.
   Uploads pass an extension allowlist and a magic-byte check, both at upload and again in the
   worker, and size limits are enforced before and while reading. The worker verifies the stored
   object's SHA-256 against the hash recorded at upload.
 - **Network.** CORS is limited to `CORS_ORIGINS`. Postgres and Redis aren't published to the host,
-  and other ports bind to 127.0.0.1 by default. Redis requires a password. Containers run as a
-  non-root user.
+  and other ports bind to 127.0.0.1 by default. Redis requires a password. The application containers (API, both
+  workers, UI) run as a non-root user. MinIO runs as root in Compose so it can write to its named
+  volume.
 - **v1 credentials.** v1 commits contained hardcoded local-development credentials
   (`admin123`, `guest:guest`, MinIO keys). They were only ever used in local Docker, and nothing
   in the current code accepts them.
