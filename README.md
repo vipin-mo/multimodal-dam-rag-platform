@@ -24,7 +24,7 @@ by profiling v1. Both were measured with the same benchmark script. See
 | Retrieval recall@5 / MRR, 22 questions with distractors | 0.864 / 0.723 | **0.955 / 0.932** |
 | Search throughput at 8 concurrent clients | 15 req/s | **30 req/s** |
 | Gateway memory growth during a 1 GB upload | +56 MiB (through the API) | **+0 MiB** (direct to storage) |
-| Image size: API / worker / UI (measured manually) | 11.7 GB each | **2.0 / 2.4 / 0.8 GB** |
+| Image size on disk: API / worker / UI | 11.7 GB each | **2.0 / 2.4 / 0.8 GB** |
 
 ## Project history
 

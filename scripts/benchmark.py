@@ -9,6 +9,8 @@ Examples:
     python scripts/benchmark.py eval -k 5
     python scripts/benchmark.py upload --file samples/large/large_upload_test.mp4 --watch dam-api-gateway
     python scripts/benchmark.py upload --direct --file samples/large/large_upload_test.mp4 --watch dam-api-gateway
+    python scripts/benchmark.py summary --file bench_report_100p.pdf
+    python scripts/benchmark.py images dam-api:dev dam-worker:dev dam-ui:dev
 
 Credentials come from DAM_USER / DAM_PASSWORD (or --user / --password).
 Results are printed and appended as JSON lines to --results (default benchmarks/results.jsonl).
@@ -237,6 +239,55 @@ class MemorySampler(threading.Thread):
                 self.peak[name] = max(self.peak[name], mib)
 
 
+# ---------------------------------------------------------------- summaries
+def cmd_summary(api: Api, args) -> None:
+    """Times a fresh (refresh=true) summary of one asset on the LLM worker. Requires an admin login."""
+    assets = api.client.get("/api/assets", params={"limit": 200}, headers=api.headers).json()["assets"]
+    asset = next((a for a in assets if a["filename"] == args.file and a["status"] == "ready"), None)
+    if asset is None:
+        raise SystemExit(f"No ready asset named {args.file!r}; ingest it first.")
+    load_before = os.getloadavg()[0]
+    t0 = time.perf_counter()
+    res = api.client.post(f"/api/assets/{asset['id']}/summary", params={"refresh": "true"}, headers=api.headers)
+    res.raise_for_status()
+    status = api.wait(res.json()["task_id"], poll=1.0)
+    elapsed = time.perf_counter() - t0
+    result = status.get("result") if isinstance(status.get("result"), dict) else {}
+    record(
+        args,
+        "summary",
+        {
+            "file": args.file,
+            "state": status["state"],
+            "seconds": round(elapsed, 1),
+            "strategy": result.get("strategy"),
+            "reduce_levels": result.get("reduce_levels"),
+            "llm_calls": result.get("llm_calls"),
+            "source_chunks": result.get("source_chunks"),
+            "host_load_1m_before": round(load_before, 2),
+        },
+    )
+
+
+# ---------------------------------------------------------------- image sizes
+def cmd_images(args) -> None:
+    """Records Docker image sizes two ways: unpacked on disk (what `docker images` shows) and the
+    compressed content size (`docker image inspect .Size` with the containerd image store)."""
+    sizes = {}
+    for tag in args.tags:
+        compressed = int(
+            subprocess.run(
+                ["docker", "image", "inspect", "--format", "{{.Size}}", tag], capture_output=True, text=True, check=True
+            ).stdout.strip()
+        )
+        listing = subprocess.run(
+            ["docker", "images", "--format", "{{.Size}}", tag], capture_output=True, text=True, check=True
+        ).stdout.split()
+        sizes[tag] = {"unpacked": listing[0] if listing else None, "compressed_gb": round(compressed / 1e9, 2)}
+        print(f"{tag:<45} unpacked {sizes[tag]['unpacked']:>8}   compressed {compressed / 1e9:5.2f} GB")
+    record(args, "image_sizes", {"images": sizes})
+
+
 def cmd_upload(api: Api, args) -> None:
     path = Path(args.file)
     sampler = MemorySampler(args.watch) if args.watch else None
@@ -298,11 +349,27 @@ def main() -> None:
     p.add_argument("--watch", nargs="*", default=[], help="container names to sample with docker stats")
     p.add_argument("--wait", action="store_true", help="also wait for ingestion to finish")
 
+    p = sub.add_parser("summary", help="time a fresh summary of one ingested asset (admin)")
+    p.add_argument("--file", required=True, help="filename of a ready asset")
+
+    p = sub.add_parser("images", help="record local Docker image sizes (no API needed)")
+    p.add_argument("tags", nargs="+")
+
     args = parser.parse_args()
+    if args.cmd == "images":
+        cmd_images(args)
+        return
     if not args.password:
         raise SystemExit("Set DAM_PASSWORD or pass --password.")
     api = Api(args.base_url, args.api, args.user, args.password)
-    {"ingest": cmd_ingest, "search": cmd_search, "eval": cmd_eval, "upload": cmd_upload}[args.cmd](api, args)
+    commands = {
+        "ingest": cmd_ingest,
+        "search": cmd_search,
+        "eval": cmd_eval,
+        "upload": cmd_upload,
+        "summary": cmd_summary,
+    }
+    commands[args.cmd](api, args)
 
 
 if __name__ == "__main__":

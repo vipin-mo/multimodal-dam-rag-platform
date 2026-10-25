@@ -98,13 +98,16 @@ The test file is 1.02 GB. Peak memory was sampled with `docker stats` during the
 
 ## Images
 
-*Measured manually with `docker images` (not recorded in `results.jsonl`).*
+Recorded with `python scripts/benchmark.py images <tags>` (`image_sizes` in `results.jsonl`).
+The v1 images are the ones built from the `v1.0` code. "Unpacked" is the size on disk that
+`docker images` shows. "Compressed" is the image content size from `docker image inspect` (Docker
+Desktop's containerd store), which is roughly what a pull downloads.
 
-| Image | v1 | v2 |
-|---|---:|---:|
-| API gateway | 11.7 GB | 2.04 GB |
-| Ingestion worker | 11.7 GB (same image) | 2.44 GB |
-| UI | 11.7 GB (same image) | 0.78 GB |
+| Image | v1 unpacked | v2 unpacked | v1 compressed | v2 compressed |
+|---|---:|---:|---:|---:|
+| API gateway | 11.7 GB | 2.04 GB | 3.93 GB | 0.43 GB |
+| Ingestion worker | 11.7 GB (same image) | 2.44 GB | 3.93 GB | 0.54 GB |
+| UI | 11.7 GB (same image) | 0.78 GB | 3.93 GB | 0.17 GB |
 
 The v1 image contained 3.3 GB of NVIDIA CUDA libraries, because PyPI's default torch wheel
 includes them, plus build tools and ffmpeg dev headers. v2 installs torch from the CPU-only
@@ -112,16 +115,18 @@ index and builds three targets from one multi-stage Dockerfile.
 
 ## Summaries (LLM worker)
 
-These ran on qwen2.5:1.5b on CPU, as background Celery tasks. *Measured manually* by timing the
-summary task from the API (not recorded in `results.jsonl`).
+These ran on qwen2.5:1.5b on CPU, as background Celery tasks. The recorded run used
+`python scripts/benchmark.py summary --file <name>`, which forces a fresh summary and times it
+until the task finishes (`summary` in `results.jsonl`). The earlier runs were timed with an
+ad-hoc script during development.
 
-| Asset | Strategy | LLM calls | Time |
-|---|---|---:|---:|
-| 10-min transcript (27 windows) | single pass | 1 | 5.7 s |
-| 100-page PDF (600 chunks) | map-reduce, 2 levels | 20 | 176–374 s (two runs) |
+| Asset | Strategy | LLM calls | Recorded run | Earlier runs |
+|---|---|---:|---:|---:|
+| 10-min transcript (27 windows) | single pass | 1 | 12.2 s | 5.7 s |
+| 100-page PDF (600 chunks) | map-reduce, 2 levels | 20 | 333.5 s | 176 s, 374 s |
 
-CPU-bound LLM time varies a lot with machine load: the slower run came after about two hours
-of continuous benchmarking.
+CPU-bound LLM time varies a lot with machine load, so treat these as a range (about 3–6 minutes
+for the 100-page PDF on this laptop), not a single number.
 
 The first version ran map-reduce partials two at a time inside the HTTP request and took 404 s.
 The two concurrent calls only queued behind each other in Ollama, which serves one request at a
