@@ -1,14 +1,14 @@
 # Benchmarks
 
-v1 → v2 numbers, measured with the same harness against v1 (tag `v1.0`, commit `868c0c8`) and v2
-(tag `v2.0`). The harness talks to v1 with `--api legacy`, so v1 rows carry the label `legacy`
-in the raw results. Raw results are in
-[`benchmarks/results.jsonl`](../benchmarks/results.jsonl).
+v1 → v2 numbers, measured with the same harness against v1 (tag `v1.0`, commit `868c0c8`) and v2.
+The harness talks to v1 with `--api legacy`, so v1 records carry `"api": "legacy"`. Raw results are
+in [`benchmarks/results.jsonl`](../benchmarks/results.jsonl); the [run index](#run-index) at the end
+says which records feed each table.
 
 **Setup.** Apple M5 (10 cores), Docker Desktop 29.1 with 12.5 GB RAM, everything on CPU.
 Embeddings: all-MiniLM-L6-v2 (text, 384-d) and CLIP ViT-B/32 (images, 512-d). Whisper `tiny`
 int8. LLM: qwen2.5:1.5b. Vision model during these runs: moondream (the default is llava:7b,
-which didn't fit in memory next to other containers on this machine).
+which didn't fit in memory next to other containers on this machine, so it was never tested).
 
 **Data.** `scripts/make_sample_corpus.py` generates every file, so results are reproducible:
 
@@ -21,25 +21,36 @@ python scripts/make_sample_corpus.py --bench --large
 export DAM_PASSWORD=...                      # admin password from .env
 python scripts/benchmark.py ingest --reset --dir samples/bench
 python scripts/benchmark.py eval -k 5
+python scripts/benchmark.py answers
 python scripts/benchmark.py search -n 200 --concurrency 1 8
 python scripts/benchmark.py upload --direct --file samples/large/large_upload_test.mp4 --watch <gateway-container> --wait
 ```
 
+**Caveats that apply to everything below.**
+- One laptop, and the load generator runs on the same machine as the stack.
+- Five runs per condition for the headline tables; the upload and memory test ran once.
+- The corpus and questions are mine and small (see [Retrieval quality](#retrieval-quality)).
+- The v1 rerun in November was rebuilt from `v1.0`. v1 doesn't pin its dependencies, so pip
+  resolved torch 2.15.0 and ctranslate2 4.9.0, where the October baseline had 2.14.0 and 4.8.2.
+
 ## Ingestion time
 
-The time from the upload response to the task reaching `SUCCESS`. Each number is the mean of 2
-runs after a warm-up run, which loads the models.
+The time from the upload response to the task reaching `SUCCESS`, after a warm-up run that loads
+the models. **Median of 5 runs, with the range across runs in brackets.**
 
-The v1 worker ran with `OMP_NUM_THREADS=1`. The **"v2, same threads"** column holds that
-budget fixed, so its difference comes from the code changes alone. **"v2, default"** uses the
-new default of 4 threads per worker process.
+The v1 worker ran with `OMP_NUM_THREADS=1`. The **"v2, same threads"** column holds that budget
+fixed, so its difference comes from the code changes alone. **"v2, default"** uses the new default
+of 4 threads per worker process, so part of that gain is just more threads.
 
 | File | v1 | v2, same threads | v2, default | What changed |
 |---|---:|---:|---:|---|
-| 100-page PDF (600 chunks) | 33.9 s | 3.6 s (**9.4×**) | 3.1 s (**11×**) | One HTTP embedding call per line was replaced by batched local `encode()` |
-| 5-min 720p video with speech | 30.5 s | 17.7 s (1.7×) | 12.8 s (**2.4×**) | `grab()` for frames that aren't sampled, batched CLIP, no pydub re-encode |
-| 10-min speech (MP3) | 19.9 s | 20.5 s (1.0×) | 13.7 s (1.45×) | Whisper dominates the time; the gain comes only from threads |
-| 1.02 GB 3-min 1080p video | 26.3 s | – | 10.2 s (2.6×) | As for the video row |
+| 100-page PDF (600 chunks) | 31.1 s (30.8–32.2) | 3.65 s (3.46–4.88), **8.5×** | 3.27 s (3.02–3.34), **9.5×** | One HTTP embedding call per line was replaced by batched local `encode()` |
+| 5-min 720p video with speech | 31.2 s (30.8–31.9) | 15.6 s (15.3–16.6), 2.0× | 12.6 s (11.8–15.4), **2.5×** | `grab()` for frames that aren't sampled, batched CLIP, no pydub re-encode |
+| 10-min speech (MP3) | 20.5 s (19.7–21.2) | 17.6 s (17.2–22.9), 1.2× | 13.6 s (13.2–14.6), 1.5× | Whisper dominates the time; most of the gain is threads |
+
+Earlier two-run measurements (October, original v1 environment) gave the same picture: PDF
+33.9 s → 3.6 s (same threads) / 3.1 s (default), video 30.5 s → 17.7 s / 12.8 s, and a 1.02 GB
+3-minute 1080p video 26.3 s → 10.2 s.
 
 Image ingestion is slower in v2 (about 5–9 s versus 0.3 s) because each image now gets a vision-model
 caption. Set `CAPTION_IMAGES=false` to turn captions off.
@@ -47,6 +58,7 @@ caption. Set `CAPTION_IMAGES=false` to turn captions off.
 ## Retrieval quality
 
 There are 22 text questions and 3 visual queries ([`eval/questions.json`](../eval/questions.json)).
+Retrieval is deterministic (same models, same index), so each condition was run once.
 
 - A text question counts as a hit when a top-5 text match comes from the expected file and
   contains the answer phrase. Alternates allow for Whisper writing "eleven" as "11".
@@ -63,25 +75,53 @@ The gain comes from chunking. v1 indexed each PDF line separately, so a fact tha
 onto a second line could not be retrieved. v2 packs whole sentences into chunks of about 500
 characters with 100 characters of overlap, and merges transcript segments into timestamped windows.
 
-**Caveat.** I wrote both the corpus and the questions, and both are small. Treat these results as
+**Caveat.** The gain is 2 questions out of 22, on a corpus and question set I wrote. Treat it as
 evidence that the pipeline works and that chunking helped, not as a general retrieval benchmark.
+
+## Answer quality (RAG)
+
+`python scripts/benchmark.py answers` asks the same 22 questions through `/api/rag` (v2 only; v1's
+RAG endpoint was not scored). An answer is **correct** when it contains one of the expected answer
+phrases. A **citation is correct** when one of the sources the answer cites is the expected file.
+LLM output varies between runs, so this was run 3 times.
+
+| Metric (corpus only, top-5 sources, qwen2.5:1.5b) | Run 1 | Run 2 | Run 3 |
+|---|---:|---:|---:|
+| Correct answers | 21/22 | 21/22 | 21/22 |
+| Answers citing the right file | 19/22 | 20/22 | 17/22 |
+| "I don't know" replies | 0 | 0 | 0 |
+| Median time per answer | 0.75 s | 0.83 s | 1.13 s |
+
+- **What it catches and what it doesn't.** Scoring is by key phrase, not by a human or a judge
+  model, so a correct fact inside an otherwise muddled answer still counts.
+- **The steady miss is "Who is on call next week?"** Whisper `tiny` transcribed that sentence as
+  "Pre-alone the on-call rotation", and the model answered from a different sentence.
+- **Citations are the weaker part.** The 1.5B model sometimes cites the wrong source number even
+  when the answer is right.
+- **The first run of this eval found a bug.** The model wrote `[Source 2]`, which the citation
+  parser ignored, so correct citations were dropped. The parser now accepts `[Source 2]`,
+  `[Sources 1 and 3]` and `[1, 3]`. That first run (20/22 correct) is kept in the raw results and
+  isn't used in the table.
 
 ## Search latency
 
-`GET /api/search` (text and visual index, k=5), 200 requests on the corpus index.
+`GET /api/search` (text and visual index, k=5), 200 requests per run on the corpus index.
+**Median of 5 runs, with the range in brackets.**
 
 | Concurrency | v1 p50 / p95 | v1 throughput | v2 p50 / p95 | v2 throughput |
 |---:|---:|---:|---:|---:|
-| 1 | 81 / 121 ms | 10.6 req/s | 67 / 93 ms | 13.0 req/s |
-| 8 | 556 / 600 ms | 15.1 req/s | 264 / 339 ms | **29.9 req/s (2×)** |
+| 1 | 83 / 106 ms | 11.0 req/s (10.7–11.1) | 65 / 81 ms | 13.5 req/s (12.8–13.6) |
+| 8 | 556 / 609 ms | 15.4 req/s (14.1–15.6) | 275 / 350 ms | **28.2 req/s (25.6–30.3), 1.8×** |
 
-v1 made blocking Qdrant calls inside the `async` handler and ran the two searches one after
-the other. v2 encodes and queries both indexes concurrently in the threadpool, which keeps the
-event loop free.
+v1 made blocking Qdrant calls and model encoding inside the `async` handler and ran the two
+searches one after the other. v2 runs encoding and both Qdrant searches concurrently in the
+threadpool, which keeps the event loop free. The October single runs (15.1 → 29.9 req/s) sit
+inside these ranges.
 
 ## Large uploads and memory
 
-The test file is 1.02 GB. Peak memory was sampled with `docker stats` during the upload.
+The test file is 1.02 GB. Peak memory was sampled with `docker stats` during the upload. This
+ran once per version.
 
 | Path | Upload time | Gateway memory (before → peak) |
 |---|---:|---:|
@@ -91,17 +131,17 @@ The test file is 1.02 GB. Peak memory was sampled with `docker stats` during the
 - **The v1 API path already streamed.** Starlette spools the request to disk, and boto3
   sends it in parts. The real limit was the Streamlit UI, which keeps the whole file in memory
   and caps uploads at 200 MB by default.
-- **In v2, large files skip both the UI and the gateway.** The CLI (`scripts/dam_upload.py`) PUTs
-  16 MiB parts to presigned URLs. The gateway only signs the URLs, then verifies the final size
-  and the file's magic bytes.
+- **In v2, large files skip both the UI and the gateway**, so +0 MiB is by design rather than a
+  tuning result. The CLI (`scripts/dam_upload.py`) PUTs 16 MiB parts to presigned URLs. The
+  gateway only signs the URLs, then verifies the final size and the file's magic bytes.
 - **Idle gateway memory fell from 1,745 to 825 MiB**, with both embedding models loaded.
 
 ## Images
 
 Recorded with `python scripts/benchmark.py images <tags>` (`image_sizes` in `results.jsonl`).
-The v1 images are the ones built from the `v1.0` code. "Unpacked" is the size on disk that
-`docker images` shows. "Compressed" is the image content size from `docker image inspect` (Docker
-Desktop's containerd store), which is roughly what a pull downloads.
+"Unpacked" is the size on disk that `docker images` shows. "Compressed" is the image content size
+from `docker image inspect` (Docker Desktop's containerd store), which is roughly what a pull
+downloads. v1 builds one image for all three services.
 
 | Image | v1 unpacked | v2 unpacked | v1 compressed | v2 compressed |
 |---|---:|---:|---:|---:|
@@ -111,7 +151,8 @@ Desktop's containerd store), which is roughly what a pull downloads.
 
 The v1 image contained 3.3 GB of NVIDIA CUDA libraries, because PyPI's default torch wheel
 includes them, plus build tools and ffmpeg dev headers. v2 installs torch from the CPU-only
-index and builds three targets from one multi-stage Dockerfile.
+index and builds three targets from one multi-stage Dockerfile. The November rebuild of v1 came
+to 12.0 GB unpacked / 3.98 GB compressed, because of the newer torch.
 
 ## Summaries (LLM worker)
 
@@ -131,3 +172,28 @@ for the 100-page PDF on this laptop), not a single number.
 The first version ran map-reduce partials two at a time inside the HTTP request and took 404 s.
 The two concurrent calls only queued behind each other in Ollama, which serves one request at a
 time, and they hit timeouts. Summaries now run sequentially on a dedicated `llm` queue.
+
+## Run index
+
+Every record in `results.jsonl`, grouped by label. Line numbers are 1-based.
+
+| Label(s) | Lines | What it is | Used in |
+|---|---|---|---|
+| `baseline-run1/2`, `baseline` (ingest) | 1–2, 5 | v1, small corpus, October | Not used (files too small to time) |
+| `baseline-bench-run1/2` | 3–4 | v1 ingestion, October | "Earlier two-run measurements" |
+| `baseline` (eval, search, upload) | 6–8 | v1 retrieval before the answer-key fix; v1 search; v1 1 GB upload | Upload table (line 8) |
+| `v2-threads1-bench-run1/2`, `v2-default-bench-run1/2` | 9–12 | v2 ingestion, October | "Earlier two-run measurements" |
+| `v2` (ingest, eval, search, upload) | 13–16 | v2 first full pass; eval before the answer-key fix | Upload table (line 16) |
+| `v2-fixed-key`, `legacy-fixed-key` | 17, 21 | Retrieval after the answer-key fix (Whisper "eleven" → "11", hyphens), corpus only | Retrieval table |
+| `v2-with-distractors`, `legacy-with-distractors` | 20, 23 | Retrieval with the bench files added | Retrieval table |
+| `v2-corpus`, `v2-distractors`, `legacy-distractors`, `v2-final-distractors`, `v2.1-distractors`, `v2.0.2-corpus` | 18–19, 22, 24, 28, 34, 42 | Setup ingests before an eval | Not used |
+| `v2-final`, `v2-final-with-distractors` | 25–27, 29 | Re-check on the final October build | Not used (same as lines 17/20) |
+| *(no label)* | 30–31 | Run during my manual UI testing on Oct 16. `retention_policy.pdf` wasn't in the index at the time (most likely removed in the delete scenario): all three misses are questions about that file, and none of its chunks appear in their top results. Its 31.6 req/s is within the normal range. | Excluded |
+| `v2.1-dedup`, `v2.1-with-distractors`, `v2.1-dedup-c1-rerun1/2` | 32–33, 35–37 | Re-check after the dedup change | Not used (same retrieval; latency inside the ranges above) |
+| `v1-images`, `v2-images` | 38–39 | Image sizes | Images table |
+| `v2-summary` | 40–41 | Summary timings | Summaries table |
+| `v2.0.2-answers` | 43 | First answer eval, before the citation-parser fix | Excluded (see Answer quality) |
+| `v2.0.2-answers-run1/2/3` | 44–46 | Answer eval | Answer quality table |
+| `v2.0.2-bench-default-run1–5`, `v2.0.2-bench-threads1-run1–5` | 47–51, 57–61 | v2 ingestion, 5 runs per thread setting | Ingestion table |
+| `v2.0.2-search-run1–5` | 52–56 | v2 search, 5 runs | Search table |
+| `v1-rebuilt-bench-run1–5`, `v1-rebuilt-search-run1–5`, `v1-rebuilt-images` | 62–72 | v1 rebuilt from `v1.0`: ingestion, search, image size | Ingestion and search tables; Images note |

@@ -14,17 +14,18 @@ Everything runs locally in Docker on CPU: FastAPI, Celery, Qdrant, Postgres, Min
 ## v1 → v2 results
 
 v1 (Sep 2026, tag `v1.0`) was a working prototype. v2 (Oct 2026, tag `v2.0`) is a rewrite driven
-by profiling v1. Both were measured with the same benchmark script. See
-[docs/BENCHMARKS.md](docs/BENCHMARKS.md) for setup, method and caveats.
+by profiling v1. Both were measured with the same benchmark script; timings are the median of 5
+runs on one laptop. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for ranges, method and caveats.
 
 | | v1 | v2 |
 |---|---:|---:|
-| Ingest a 100-page PDF | 33.9 s | **3.1 s** (11×) |
-| Ingest a 5-min video with speech | 30.5 s | **12.8 s** (2.4×) |
-| Retrieval recall@5 / MRR, 22 questions with distractors | 0.864 / 0.723 | **0.955 / 0.932** |
-| Search throughput at 8 concurrent clients | 15 req/s | **30 req/s** |
-| Gateway memory growth during a 1 GB upload | +56 MiB (through the API) | **+0 MiB** (direct to storage) |
-| Image size on disk: API / worker / UI | 11.7 GB each | **2.0 / 2.4 / 0.8 GB** |
+| Ingest a 100-page PDF | 31.1 s | **3.3 s** (9.5×; 8.5× at the same thread count) |
+| Ingest a 5-min video with speech | 31.2 s | **12.6 s** (2.5×; 2.0× at the same thread count) |
+| Retrieval recall@5 / MRR, 22 questions with distractors | 0.86 / 0.72 (19/22) | **0.95 / 0.93** (21/22) |
+| RAG answers containing the expected fact, 22 questions | not measured | **21/22** (3 runs) |
+| Search throughput at 8 concurrent clients | 15.4 req/s | **28.2 req/s** (1.8×) |
+| Gateway memory growth during a 1 GB upload (1 run) | +56 MiB (through the API) | **+0 MiB** (direct to storage) |
+| Image size on disk, per service: API / worker / UI | 11.7 GB (one shared image) | **2.0 / 2.4 / 0.8 GB** |
 
 ## Project history
 
@@ -35,6 +36,9 @@ by profiling v1. Both were measured with the same benchmark script. See
   security (secrets, auth, upload validation), reliability (background LLM worker, retry policy),
   a real test suite with CI, and new features: an asset catalog, direct large uploads, image
   captions, cited answers and deduplication.
+- **v2.0.1 – v2.0.2 (Oct – Nov 2026):** fixes from two written external reviews: admin-only summary
+  refresh, a database-enforced duplicate check, per-user task visibility, a scored answer-quality
+  eval, five-run benchmarks, and corrected wording wherever a claim overstated the code.
 
 To reproduce the comparison, check out each tag and run `scripts/benchmark.py`; v1 needs `--api legacy`.
 
@@ -132,8 +136,8 @@ Prometheus and Grafana add 2 more under the `monitoring` profile.
 ### Design decisions
 
 - **The worker embeds locally.** v1 sent every text chunk to the gateway over
-  HTTP: one call per PDF line, on an unauthenticated endpoint. Removing that hop made PDFs about
-  9× faster with the same thread budget and closed the security hole.
+  HTTP: one call per PDF line, on an unauthenticated endpoint. Removing that hop made PDFs 8.5×
+  faster with the same thread budget and closed the security hole.
 - **Vectors are keyed by asset ID, with deterministic point IDs.** Re-indexing deletes and rewrites
   an asset's points, so retries and re-uploads never create duplicates.
 - **Long LLM work runs off the request path.** A 100-page map-reduce summary is about 20 LLM calls,
@@ -206,7 +210,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 | `GET /api/search?query=&media_type=&asset_id=&limit=` | any | Text and visual search in one call |
 | `POST /api/rag` | any | `{question, top_k, media_type?}`; returns the answer, numbered sources and cited numbers |
 | `POST /api/assets/{id}/summary` | any | `200` with the cached summary, or `202` with a task ID; `?refresh=true` is admin-only |
-| `GET /api/tasks/{task_id}` | any | `PENDING` / `PROGRESS` (percent and stage) / `SUCCESS` / `FAILURE` |
+| `GET /api/tasks/{task_id}` | own tasks (admin: any) | `PENDING` / `PROGRESS` (percent and stage) / `SUCCESS` / `FAILURE`; `404` for other users' tasks |
 | `POST /api/admin/reset` | admin | Deletes all objects, vectors and catalog entries |
 | `GET /health` · `GET /ready` · `GET /metrics` | – | Liveness, readiness, Prometheus metrics |
 
@@ -225,10 +229,16 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
   Uploads pass an extension allowlist and a magic-byte check, both at upload and again in the
   worker, and size limits are enforced before and while reading. The worker verifies the stored
   object's SHA-256 against the hash recorded at upload.
+- **Duplicates.** A partial unique index in Postgres allows only one active asset per SHA-256
+  (unless a duplicate was explicitly allowed), so two identical uploads racing each other can't
+  both get in. The catalog row is claimed before any bytes are stored.
+- **Tasks.** Every Celery task is recorded with the user who started it. Users can poll only their
+  own tasks; admins can poll any. Another user's task returns the same `404` as a task that
+  doesn't exist.
 - **Network.** CORS is limited to `CORS_ORIGINS`. Postgres and Redis aren't published to the host,
-  and other ports bind to 127.0.0.1 by default. Redis requires a password. The application containers (API, both
-  workers, UI) run as a non-root user. MinIO runs as root in Compose so it can write to its named
-  volume.
+  and other ports bind to 127.0.0.1 by default. Redis requires a password. The application
+  containers (API, both workers, UI) run as a non-root user. MinIO runs as root in Compose so it
+  can write to its named volume.
 - **v1 credentials.** v1 commits contained hardcoded local-development credentials
   (`admin123`, `guest:guest`, MinIO keys). They were only ever used in local Docker, and nothing
   in the current code accepts them.
@@ -239,8 +249,8 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0
 pip install -r requirements/dev.txt
 ruff check . && ruff format --check .
-pytest --cov                          # 134 unit tests, no network, ~12 s
-./scripts/run-integration-tests.sh    # 9 integration tests against real Qdrant, Postgres and MinIO
+pytest --cov                          # 148 unit tests, no network, ~15 s
+./scripts/run-integration-tests.sh    # 10 integration tests against real Qdrant, Postgres and MinIO
 ```
 
 - **Unit tests** run against in-memory SQLite with faked S3, Qdrant, Celery and LLM clients. They
@@ -249,11 +259,13 @@ pytest --cov                          # 134 unit tests, no network, ~12 s
   - RBAC on every admin route
   - path-traversal filenames, content sniffing and size limits
   - whitespace, control-character and injection-style queries
-  - citation parsing, LLM retry policy and map-reduce
+  - citation parsing (including `[Source 2]` and `[1, 3]` forms), LLM retry policy and map-reduce
+  - the duplicate race (a duplicate that slips past the check is still rejected) and task ownership
   - the worker pipelines, using real pypdf, OpenCV and Pillow on generated files
 - **Integration tests** use the real MiniLM, CLIP and Whisper models and real services. They
   check ingestion, text-to-image search, transcript timestamps, idempotent re-indexing, delete,
-  the presigned upload round-trip and media streaming. Only the LLM is faked.
+  the presigned upload round-trip, media streaming and the Postgres unique index. Only the LLM is
+  faked.
 - **CI** (GitHub Actions) runs lint, unit and integration tests, and builds all three images.
 
 ## Limitations
@@ -271,9 +283,20 @@ pytest --cov                          # 134 unit tests, no network, ~12 s
   swaps models.
 - **Streamlit holds UI uploads in memory**, hence the 200 MB UI cap. Use the direct uploader
   for anything larger.
-- **The eval set is small and synthetic**: 22 questions over a corpus I wrote. It shows the
-  pipeline works and that chunking helped. It isn't a general retrieval benchmark.
-- **Single-node Docker Compose.** There are no Kubernetes manifests.
+- **RAG is single-turn.** Each question is answered on its own; there is no chat history.
+  Retrieval is dense vectors only: no BM25 or hybrid search, and no reranker.
+- **LLaVA is the default vision model but was never tested here.** It didn't fit in memory next to
+  the rest of the stack on the test machine; every run used moondream. The vision model is used
+  for still images only (captions and image summaries), not video frames.
+- **The eval set is small and synthetic.** It has 22 questions over a corpus I wrote, and the
+  retrieval gain is 2 questions (19 → 21 of 22 with distractors). The answer-quality eval scores
+  the same 22 questions by key phrase, not by a human or a judge model. It shows the pipeline works
+  and that chunking helped; it isn't a general benchmark.
+- **Benchmark conditions.** Five runs per condition on one laptop (Apple M5, CPU only), with the
+  load generator on the same machine. Part of the ingestion speed-up comes from worker threads;
+  BENCHMARKS.md reports it at equal thread counts too.
+- **Single-host Docker Compose.** The API and both workers are one codebase in three containers.
+  There are no Kubernetes manifests.
 
 ## Project layout
 
@@ -290,6 +313,25 @@ scripts/         init-env, dam_upload, benchmark, sample corpus, integration run
 eval/            retrieval questions        benchmarks/   raw benchmark results
 monitoring/      Prometheus + Grafana       tests/        unit + integration
 ```
+
+## How this was built
+
+Built with Claude Code as an AI pair programmer. I set the goals and scope, made the key design
+decisions, tested every scenario by hand and reviewed all changes; the assistant wrote most of the
+code and ran the benchmarks. v2 commits were created in batches, which is why several share
+timestamps.
+
+- **Decisions that were mine.** Dropping Kubernetes instead of half-building it, adding the asset
+  catalog, direct large uploads, image captions and clickable citations, framing the work as v1 →
+  v2, and what to claim publicly.
+- **Bugs found by hand.** Manual browser testing found problems the automated tests didn't cover:
+  duplicate assets doubling every search result, one video scene filling all the visual results,
+  the summary progress total jumping, and a stale player after a new search. All four are fixed;
+  the three on the API side also have tests.
+- **Reviews.** AI external reviewer checked the code.
+  Every finding was either fixed or listed under Limitations.
+- **Verification.** Every number in the results table comes from `scripts/benchmark.py`, with raw
+  results committed in `benchmarks/results.jsonl` and tags `v1.0` / `v2.0` to reproduce both sides.
 
 ## License
 
