@@ -150,7 +150,8 @@ RAG_SYSTEM = (
 def build_rag_prompt(question: str, sources: list[dict]) -> str:
     blocks = [f"[{s['n']}] ({s['label']})\n{s['text']}" for s in sources]
     # Small models follow instructions placed right before the answer far more reliably than system
-    # prompts: with this tail, qwen2.5:1.5b cited sources 5/5 times versus 0/5 without it.
+    # prompts: in a recorded A/B over 22 questions (scripts/citation_ab.py), qwen2.5:1.5b cited a
+    # source in 22/22 answers with this tail versus 13-15/22 without it.
     return (
         "Sources:\n\n" + "\n\n".join(blocks) + f"\n\nQuestion: {question}\n"
         "Answer in 1-3 sentences. End every sentence with the number of the source it came from, like [1]. "

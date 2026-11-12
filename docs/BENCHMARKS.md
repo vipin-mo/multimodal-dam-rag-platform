@@ -94,6 +94,9 @@ LLM output varies between runs, so this was run 3 times.
 
 - **What it catches and what it doesn't.** Scoring is by key phrase, not by a human or a judge
   model, so a correct fact inside an otherwise muddled answer still counts.
+- **The answer key was widened once, after the first run.** That run scored 20/22. One miss was a
+  correct answer ("$75 per day") that the key, "75 dollars per day", didn't match, so "75 per day"
+  was added as an alternate. The three runs in the table use the widened key.
 - **The steady miss is "Who is on call next week?"** Whisper `tiny` transcribed that sentence as
   "Pre-alone the on-call rotation", and the model answered from a different sentence.
 - **Citations are the weaker part.** The 1.5B model sometimes cites the wrong source number even
@@ -102,6 +105,23 @@ LLM output varies between runs, so this was run 3 times.
   parser ignored, so correct citations were dropped. The parser now accepts `[Source 2]`,
   `[Sources 1 and 3]` and `[1, 3]`. That first run (20/22 correct) is kept in the raw results and
   isn't used in the table.
+
+### Citation prompt A/B
+
+`scripts/citation_ab.py` checks one prompt decision directly. For each of the 22 questions it
+retrieves the same top-5 sources once, then asks the model twice:
+- **A, v2.0's original prompt:** the citation rules are only in the system prompt.
+- **B, the current prompt:** a short citation instruction placed right before "Answer:".
+
+Same model, system prompt and citation parser. Run twice:
+
+| | A: original prompt | B: current prompt |
+|---|---:|---:|
+| Answers with any citation | 13/22, 15/22 | **22/22, 22/22** |
+| Answers citing the expected file | 13/22, 15/22 | **19/22, 19/22** |
+
+An earlier informal check (5 tries of one question, 0/5 → 5/5) led to the change. This A/B is the
+recorded version of it.
 
 ## Search latency
 
@@ -171,7 +191,9 @@ for the 100-page PDF on this laptop), not a single number.
 
 The first version ran map-reduce partials two at a time inside the HTTP request and took 404 s.
 The two concurrent calls only queued behind each other in Ollama, which serves one request at a
-time, and they hit timeouts. Summaries now run sequentially on a dedicated `llm` queue.
+time, and they hit timeouts. Because read timeouts were retried, one request in that version ran
+for about 12 minutes across four timed-out attempts before failing. This was seen in the gateway
+logs on Oct 15 and isn't in `results.jsonl`. Summaries now run sequentially on a dedicated `llm` queue.
 
 ## Run index
 
@@ -197,3 +219,4 @@ Every record in `results.jsonl`, grouped by label. Line numbers are 1-based.
 | `v2.0.2-bench-default-run1–5`, `v2.0.2-bench-threads1-run1–5` | 47–51, 57–61 | v2 ingestion, 5 runs per thread setting | Ingestion table |
 | `v2.0.2-search-run1–5` | 52–56 | v2 search, 5 runs | Search table |
 | `v1-rebuilt-bench-run1–5`, `v1-rebuilt-search-run1–5`, `v1-rebuilt-images` | 62–72 | v1 rebuilt from `v1.0`: ingestion, search, image size | Ingestion and search tables; Images note |
+| `v2.0.2-citation-ab-run1/2` | 73–74 | Citation prompt A/B, 22 questions × 2 prompts | Citation prompt A/B |

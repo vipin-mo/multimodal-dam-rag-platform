@@ -36,7 +36,7 @@ runs on one laptop. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for ranges, met
   security (secrets, auth, upload validation), reliability (background LLM worker, retry policy),
   a real test suite with CI, and new features: an asset catalog, direct large uploads, image
   captions, cited answers and deduplication.
-- **v2.0.1 – v2.0.2 (Oct – Nov 2026):** fixes from two written external reviews: admin-only summary
+- **v2.0.1 – v2.0.2 (Oct – Nov 2026):** fixes from two written reviews by a separate AI reviewer: admin-only summary
   refresh, a database-enforced duplicate check, per-user task visibility, a scored answer-quality
   eval, five-run benchmarks, and corrected wording wherever a claim overstated the code.
 
@@ -328,8 +328,8 @@ timestamps.
   duplicate assets doubling every search result, one video scene filling all the visual results,
   the summary progress total jumping, and a stale player after a new search. All four are fixed;
   the three on the API side also have tests.
-- **Reviews.** AI external reviewer checked the code.
-  Every finding was either fixed or listed under Limitations.
+- **Reviews.** Two written reviews by a separate AI reviewer checked the code against the README
+  and my resume. Every finding was either fixed or listed under Limitations.
 - **Verification.** Every number in the results table comes from `scripts/benchmark.py`, with raw
   results committed in `benchmarks/results.jsonl` and tags `v1.0` / `v2.0` to reproduce both sides.
 
