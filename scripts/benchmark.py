@@ -9,6 +9,7 @@ Examples:
     python scripts/benchmark.py eval -k 5
     python scripts/benchmark.py upload --file samples/large/large_upload_test.mp4 --watch dam-api-gateway
     python scripts/benchmark.py upload --direct --file samples/large/large_upload_test.mp4 --watch dam-api-gateway
+    python scripts/benchmark.py answers            # RAG answer accuracy on the same 22 questions
     python scripts/benchmark.py summary --file bench_report_100p.pdf
     python scripts/benchmark.py images dam-api:dev dam-worker:dev dam-ui:dev
 
@@ -239,6 +240,53 @@ class MemorySampler(threading.Thread):
                 self.peak[name] = max(self.peak[name], mib)
 
 
+# ---------------------------------------------------------------- answer quality
+def cmd_answers(api: Api, args) -> None:
+    """Scores the generated RAG answers, not just retrieval: an answer is correct when it contains one
+    of the expected answer phrases; a citation is correct when a cited source is the expected file."""
+    questions = json.loads(Path(args.questions).read_text())["text"]
+    correct = cited_right = refused = 0
+    rows = []
+    for item in questions:
+        t0 = time.perf_counter()
+        res = api.client.post("/api/rag", json={"question": item["q"], "top_k": args.k}, headers=api.headers)
+        res.raise_for_status()
+        body = res.json()
+        answer = body["answer"]
+        ok = any(normalize(a) in normalize(answer) for a in item["answer"])
+        cited_files = {s["filename"] for s in body["sources"] if s["n"] in body["cited"]}
+        cite_ok = item["file"] in cited_files
+        no_answer = answer.lower().startswith(("i don't know", "i couldn't find"))
+        correct += ok
+        cited_right += cite_ok
+        refused += no_answer
+        rows.append(
+            {
+                "q": item["q"],
+                "correct": ok,
+                "cited_expected_file": cite_ok,
+                "no_answer": no_answer,
+                "seconds": round(time.perf_counter() - t0, 2),
+                "answer": answer[:200],
+            }
+        )
+        print(f"{'OK ' if ok else 'MISS'} {'cite' if cite_ok else '    '} {item['q'][:60]}")
+    n = len(questions)
+    record(
+        args,
+        "answer_eval",
+        {
+            "k": args.k,
+            "answer_accuracy": round(correct / n, 3),
+            "answers_correct": f"{correct}/{n}",
+            "citation_accuracy": round(cited_right / n, 3),
+            "no_answer": refused,
+            "median_seconds": statistics.median(r["seconds"] for r in rows),
+            "rows": rows,
+        },
+    )
+
+
 # ---------------------------------------------------------------- summaries
 def cmd_summary(api: Api, args) -> None:
     """Times a fresh (refresh=true) summary of one asset on the LLM worker. Requires an admin login."""
@@ -349,6 +397,9 @@ def main() -> None:
     p.add_argument("--watch", nargs="*", default=[], help="container names to sample with docker stats")
     p.add_argument("--wait", action="store_true", help="also wait for ingestion to finish")
 
+    p = sub.add_parser("answers", help="score RAG answers (needs the LLM)")
+    p.add_argument("-k", type=int, default=5)
+
     p = sub.add_parser("summary", help="time a fresh summary of one ingested asset (admin)")
     p.add_argument("--file", required=True, help="filename of a ready asset")
 
@@ -368,6 +419,7 @@ def main() -> None:
         "eval": cmd_eval,
         "upload": cmd_upload,
         "summary": cmd_summary,
+        "answers": cmd_answers,
     }
     commands[args.cmd](api, args)
 

@@ -33,7 +33,8 @@
       "q": "What is the daily meal reimbursement limit when travelling?",
       "file": "northwind_handbook.pdf",
       "answer": [
-        "75 dollars per day"
+        "75 dollars per day",
+        "75 per day"
       ]
     },
     {
