@@ -14,7 +14,21 @@ import uuid
 from datetime import UTC, datetime
 
 import bcrypt
-from sqlalchemy import JSON, BigInteger, Column, DateTime, Float, ForeignKey, String, Text, create_engine, text
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Index,
+    String,
+    Text,
+    create_engine,
+    false,
+    text,
+)
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -53,10 +67,24 @@ class User(Base):
         return bcrypt.checkpw(plain_password.encode("utf-8"), self.hashed_password.encode("utf-8"))
 
 
+# At most one active (not failed) asset per content hash, unless a duplicate was explicitly allowed.
+# Enforced by the database, so two identical uploads racing each other can't both get through.
+ACTIVE_HASH = "sha256 IS NOT NULL AND status <> 'failed' AND NOT duplicate_allowed"
+
+
 class Asset(Base):
     """Catalog entry for one uploaded file. Vectors in Qdrant reference `id` as `asset_id`."""
 
     __tablename__ = "assets"
+    __table_args__ = (
+        Index(
+            "uq_assets_active_sha256",
+            "sha256",
+            unique=True,
+            postgresql_where=text(ACTIVE_HASH),
+            sqlite_where=text(ACTIVE_HASH),
+        ),
+    )
 
     id = Column(String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
     filename = Column(String(255), nullable=False)  # sanitized original name, for display
@@ -65,7 +93,8 @@ class Asset(Base):
     content_type = Column(String(64), nullable=False)
     size_bytes = Column(BigInteger, nullable=True)
     sha256 = Column(String(64), nullable=True, index=True)  # content hash: dedup + integrity check
-    # pending_upload -> queued -> processing -> ready | failed
+    duplicate_allowed = Column(Boolean, nullable=False, default=False, server_default=false())
+    # uploading | pending_upload -> queued -> processing -> ready | failed
     status = Column(String(16), nullable=False, default="queued", index=True)
     task_id = Column(String(64), nullable=True)
     error = Column(Text, nullable=True)
@@ -96,6 +125,18 @@ class Asset(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class Task(Base):
+    """Who started which Celery task, so users can only poll their own (admins can poll any)."""
+
+    __tablename__ = "tasks"
+
+    task_id = Column(String(64), primary_key=True)
+    kind = Column(String(16), nullable=False)  # ingest | summary
+    asset_id = Column(String(36), nullable=True, index=True)
+    username = Column(String(64), ForeignKey("users.username", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utcnow)
 
 
 def get_db():
@@ -152,6 +193,22 @@ def _upgrade_schema() -> None:
     with engine.begin() as conn:
         conn.execute(text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS sha256 VARCHAR(64)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_assets_sha256 ON assets (sha256)"))
+        conn.execute(
+            text("ALTER TABLE assets ADD COLUMN IF NOT EXISTS duplicate_allowed BOOLEAN NOT NULL DEFAULT false")
+        )
+        # Copies created before the unique index existed: keep the oldest active one as the original
+        # and mark the rest as allowed duplicates, so the index can be built.
+        conn.execute(
+            text(
+                "UPDATE assets a SET duplicate_allowed = true "
+                "WHERE a.sha256 IS NOT NULL AND a.status <> 'failed' AND NOT a.duplicate_allowed "
+                "AND EXISTS (SELECT 1 FROM assets b WHERE b.sha256 = a.sha256 AND b.status <> 'failed' "
+                "AND NOT b.duplicate_allowed AND (b.created_at, b.id) < (a.created_at, a.id))"
+            )
+        )
+        conn.execute(
+            text(f"CREATE UNIQUE INDEX IF NOT EXISTS uq_assets_active_sha256 ON assets (sha256) WHERE {ACTIVE_HASH}")
+        )
 
 
 def init_db() -> None:

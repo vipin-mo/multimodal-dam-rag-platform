@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app import embeddings, llm, main
-from app.database import Asset, SessionLocal
+from app.database import Asset, SessionLocal, Task
 from tests.conftest import scored
 
 
@@ -261,10 +261,36 @@ def test_cached_summary_returned_without_queueing(client, viewer_headers, admin_
     ],
 )
 def test_task_status_mapping(client, viewer_headers, monkeypatch, state, info, result, expected):
+    _record_task("t-1", "test_viewer")
     monkeypatch.setattr(main, "AsyncResult", lambda *_a, **_k: SimpleNamespace(state=state, info=info, result=result))
     body = client.get("/api/tasks/t-1", headers=viewer_headers).json()
     assert body["state"] == state
     assert expected.items() <= body.items()
+
+
+def _record_task(task_id: str, username: str, kind: str = "summary") -> None:
+    with SessionLocal() as db:
+        db.add(Task(task_id=task_id, kind=kind, username=username))
+        db.commit()
+
+
+def test_users_can_only_poll_their_own_tasks(client, viewer_headers, admin_headers, monkeypatch):
+    monkeypatch.setattr(main, "AsyncResult", lambda *_a, **_k: SimpleNamespace(state="PENDING", info=None, result=None))
+    _record_task("admin-task", "test_admin", kind="ingest")
+    _record_task("viewer-task", "test_viewer")
+    # A viewer can't see someone else's task, and can't tell it apart from one that doesn't exist.
+    assert client.get("/api/tasks/admin-task", headers=viewer_headers).status_code == 404
+    assert client.get("/api/tasks/no-such-task", headers=viewer_headers).status_code == 404
+    assert client.get("/api/tasks/viewer-task", headers=viewer_headers).status_code == 200
+    assert client.get("/api/tasks/viewer-task", headers=admin_headers).status_code == 200  # admins see all
+
+
+def test_enqueued_tasks_are_recorded_with_their_owner(client, viewer_headers, make_asset):
+    asset = make_asset()
+    task_id = client.post(f"/api/assets/{asset.id}/summary", headers=viewer_headers).json()["task_id"]
+    with SessionLocal() as db:
+        task = db.get(Task, task_id)
+        assert (task.kind, task.asset_id, task.username) == ("summary", asset.id, "test_viewer")
 
 
 def test_health_is_unauthenticated_liveness(client):

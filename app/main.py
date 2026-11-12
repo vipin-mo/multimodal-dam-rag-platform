@@ -22,10 +22,11 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy import text as sql_text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import config, embeddings, llm, media, storage, vectors
-from app.database import Asset, SessionLocal, User, engine, get_db, init_db
+from app.database import Asset, SessionLocal, Task, User, engine, get_db, init_db
 from app.security import authenticate, create_access_token, require_admin, require_user
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -52,7 +53,7 @@ async def lifespan(_: FastAPI):
     warmup.cancel()
 
 
-app = FastAPI(title="Multimodal DAM Gateway", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Multimodal DAM Gateway", version="2.0.2", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
@@ -145,8 +146,14 @@ def format_hit(point) -> dict:
     }
 
 
-def enqueue_ingestion(asset_id: str) -> str:
+def record_task(db: Session, task_id: str, kind: str, asset_id: str | None, username: str) -> None:
+    db.add(Task(task_id=task_id, kind=kind, asset_id=asset_id, username=username))
+    db.commit()
+
+
+def enqueue_ingestion(db: Session, asset_id: str, username: str) -> str:
     task = celery_client.send_task("dam.ingest_asset", args=[asset_id], queue=config.INGESTION_QUEUE)
+    record_task(db, task.id, "ingest", asset_id, username)
     return task.id
 
 
@@ -171,6 +178,20 @@ def hash_upload(fileobj, limit: int) -> tuple[str, int]:
         digest.update(block)
     fileobj.seek(0)
     return digest.hexdigest(), size
+
+
+def claim_asset_row(db: Session, asset: Asset) -> None:
+    """Inserts the catalog row before any bytes are stored. The partial unique index on sha256 makes
+    the database the final arbiter: if an identical upload won a race past reject_duplicate(), this
+    insert fails and the request gets the same 409."""
+    db.add(asset)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        if asset.sha256:
+            reject_duplicate(db, asset.sha256)
+        raise HTTPException(status_code=409, detail="This content is already being uploaded.")
 
 
 def reject_duplicate(db: Session, sha256: str) -> None:
@@ -297,8 +318,6 @@ def upload_asset(
 
     asset_id = str(uuid.uuid4())
     key = media.object_key(asset_id, safe_name)
-    storage.upload_stream(file.file, key, content_type)
-
     asset = Asset(
         id=asset_id,
         filename=safe_name,
@@ -307,12 +326,21 @@ def upload_asset(
         content_type=content_type,
         size_bytes=size,
         sha256=sha256,
-        status="queued",
+        duplicate_allowed=allow_duplicate,
+        status="uploading",
         uploaded_by=user.username,
     )
-    db.add(asset)
+    claim_asset_row(db, asset)
+    try:
+        storage.upload_stream(file.file, key, content_type)
+    except Exception:
+        db.delete(asset)
+        db.commit()
+        raise
+
+    asset.status = "queued"
     db.commit()
-    asset.task_id = enqueue_ingestion(asset_id)
+    asset.task_id = enqueue_ingestion(db, asset_id, user.username)
     db.commit()
     return {"asset_id": asset_id, "task_id": asset.task_id, "filename": safe_name, "status": asset.status}
 
@@ -356,22 +384,27 @@ def init_direct_upload(req: DirectUploadInit, user: User = Depends(require_admin
 
     asset_id = str(uuid.uuid4())
     key = media.object_key(asset_id, safe_name)
-    upload_id = storage.start_multipart(key, content_type)
-    part_size, part_count = storage.plan_parts(req.size_bytes)
-    db.add(
-        Asset(
-            id=asset_id,
-            filename=safe_name,
-            object_key=key,
-            media_type=media_type,
-            content_type=content_type,
-            size_bytes=req.size_bytes,
-            sha256=req.sha256,
-            status="pending_upload",
-            uploaded_by=user.username,
-            stats={"upload_id": upload_id},
-        )
+    asset = Asset(
+        id=asset_id,
+        filename=safe_name,
+        object_key=key,
+        media_type=media_type,
+        content_type=content_type,
+        size_bytes=req.size_bytes,
+        sha256=req.sha256,
+        duplicate_allowed=req.allow_duplicate,
+        status="pending_upload",
+        uploaded_by=user.username,
     )
+    claim_asset_row(db, asset)
+    try:
+        upload_id = storage.start_multipart(key, content_type)
+    except Exception:
+        db.delete(asset)
+        db.commit()
+        raise
+    part_size, part_count = storage.plan_parts(req.size_bytes)
+    asset.stats = {"upload_id": upload_id}
     db.commit()
     return {
         "asset_id": asset_id,
@@ -389,7 +422,7 @@ def _pending_upload(asset: Asset, upload_id: str) -> None:
 @app.post("/api/uploads/{asset_id}/complete", status_code=202)
 def complete_direct_upload(
     req: DirectUploadComplete,
-    _: User = Depends(require_admin),
+    user: User = Depends(require_admin),
     asset: Asset = Depends(get_asset),
     db: Session = Depends(get_db),
 ):
@@ -410,7 +443,7 @@ def complete_direct_upload(
 
     asset.status, asset.stats = "queued", {}
     db.commit()
-    asset.task_id = enqueue_ingestion(asset.id)
+    asset.task_id = enqueue_ingestion(db, asset.id, user.username)
     db.commit()
     return {"asset_id": asset.id, "task_id": asset.task_id, "filename": asset.filename, "status": asset.status}
 
@@ -474,18 +507,30 @@ def delete_asset(_: User = Depends(require_admin), asset: Asset = Depends(get_as
 
 
 @app.post("/api/assets/{asset_id}/reindex", status_code=202)
-def reindex_asset(_: User = Depends(require_admin), asset: Asset = Depends(get_asset), db: Session = Depends(get_db)):
+def reindex_asset(
+    user: User = Depends(require_admin), asset: Asset = Depends(get_asset), db: Session = Depends(get_db)
+):
     if asset.status not in ("ready", "failed"):
         raise HTTPException(status_code=409, detail=f"Asset is {asset.status}; wait for it to finish.")
     asset.status, asset.error, asset.summary = "queued", None, None
-    asset.task_id = enqueue_ingestion(asset.id)
+    try:
+        db.commit()  # a failed asset becoming active again may now clash with another active copy
+    except IntegrityError:
+        db.rollback()
+        reject_duplicate(db, asset.sha256)
+        raise
+    asset.task_id = enqueue_ingestion(db, asset.id, user.username)
     db.commit()
     return {"asset_id": asset.id, "task_id": asset.task_id, "status": asset.status}
 
 
 @app.get("/api/tasks/{task_id}")
-def task_status(task_id: str, _: User = Depends(require_user)):
-    """Celery task state from the Redis result backend: PENDING, STARTED, PROGRESS, SUCCESS, FAILURE."""
+def task_status(task_id: str, user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """Celery task state from the Redis result backend: PENDING, STARTED, PROGRESS, SUCCESS, FAILURE.
+    Users see only tasks they started; admins see all. Unknown and foreign tasks both return 404."""
+    task = db.get(Task, task_id)
+    if task is None or (user.role != "admin" and task.username != user.username):
+        raise HTTPException(status_code=404, detail="Task not found.")
     result = AsyncResult(task_id, app=celery_client)
     body = {"task_id": task_id, "state": result.state, "progress": 0, "stage": None, "result": None}
     if result.state == "PROGRESS" and isinstance(result.info, dict):
@@ -580,6 +625,7 @@ def summarize_asset(
     refresh: bool = False,
     user: User = Depends(require_user),
     asset: Asset = Depends(get_asset),
+    db: Session = Depends(get_db),
 ):
     """Returns the cached summary (200), or queues one on the LLM worker and returns its task (202).
     Long documents are map-reduced over many LLM calls, which can take minutes on CPU, so the work
@@ -593,4 +639,5 @@ def summarize_asset(
     if asset.summary and not refresh:
         return {"asset_id": asset.id, "filename": asset.filename, "cached": True, **asset.summary}
     task = celery_client.send_task("dam.summarize_asset", args=[asset.id], queue=config.LLM_QUEUE)
+    record_task(db, task.id, "summary", asset.id, user.username)
     return JSONResponse(status_code=202, content={"asset_id": asset.id, "task_id": task.id, "status": "queued"})

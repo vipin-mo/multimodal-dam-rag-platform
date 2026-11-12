@@ -1,6 +1,7 @@
 import io
 
 import pytest
+from fastapi.testclient import TestClient
 
 from app import main
 from app.database import Asset, SessionLocal
@@ -188,3 +189,59 @@ def test_direct_upload_duplicate_rejected_before_any_bytes(client, admin_headers
 def test_direct_upload_rejects_malformed_hash(client, admin_headers):
     body = {"filename": "video.mp4", "size_bytes": 10, "sha256": "not-a-hash"}
     assert client.post("/api/uploads/init", headers=admin_headers, json=body).status_code == 422
+
+
+def test_database_blocks_a_duplicate_that_slips_past_the_check(client, admin_headers, fake_s3, monkeypatch):
+    """Two identical uploads at the same moment can both pass reject_duplicate(); the partial unique
+    index must still let only one in, before anything is written to storage."""
+    assert _upload(client, admin_headers, "first.pdf", PDF_BYTES).status_code == 202
+    fake_s3.upload_fileobj.reset_mock()
+    monkeypatch.setattr(main, "reject_duplicate_original", main.reject_duplicate, raising=False)
+    calls = {"n": 0}
+
+    def race_lost(db, sha256):  # first call (before insert) sees nothing, as in a race
+        calls["n"] += 1
+        if calls["n"] > 1:
+            main.reject_duplicate_original(db, sha256)
+
+    monkeypatch.setattr(main, "reject_duplicate", race_lost)
+    res = _upload(client, admin_headers, "second.pdf", PDF_BYTES)
+    assert res.status_code == 409
+    assert "Already in the library" in res.json()["detail"]
+    fake_s3.upload_fileobj.assert_not_called()
+    with SessionLocal() as db:
+        assert db.query(Asset).count() == 1
+
+
+def test_allowed_duplicates_are_flagged_and_do_not_trip_the_index(client, admin_headers):
+    _upload(client, admin_headers, "a.pdf", PDF_BYTES)
+    for name in ("b.pdf", "c.pdf"):
+        res = client.post(
+            "/api/upload",
+            headers=admin_headers,
+            params={"allow_duplicate": "true"},
+            files={"file": (name, io.BytesIO(PDF_BYTES))},
+        )
+        assert res.status_code == 202
+    with SessionLocal() as db:
+        flags = sorted(a.duplicate_allowed for a in db.query(Asset))
+        assert flags == [False, True, True]
+
+
+def test_failed_upload_to_storage_removes_the_claimed_row(client, admin_headers, fake_s3):
+    fake_s3.upload_fileobj.side_effect = RuntimeError("storage down")
+    res = TestClient(main.app, raise_server_exceptions=False).post(
+        "/api/upload", headers=admin_headers, files={"file": ("x.pdf", io.BytesIO(PDF_BYTES))}
+    )
+    assert res.status_code == 500
+    with SessionLocal() as db:
+        assert db.query(Asset).count() == 0  # the hash is free again for a retry
+
+
+def test_reindex_refuses_to_revive_a_failed_copy_of_active_content(client, admin_headers, make_asset):
+    make_asset(sha256="b" * 64, status="ready")
+    failed = make_asset(sha256="b" * 64, status="failed")
+    res = client.post(f"/api/assets/{failed.id}/reindex", headers=admin_headers)
+    assert res.status_code == 409
+    with SessionLocal() as db:
+        assert db.get(Asset, failed.id).status == "failed"

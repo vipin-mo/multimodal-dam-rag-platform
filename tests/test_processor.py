@@ -188,3 +188,19 @@ def test_ingest_task_fails_on_hash_mismatch(pdf_file, stored_asset, fake_qdrant)
     with SessionLocal() as db:
         assert "SHA-256" in db.get(Asset, ASSET_ID).error
     fake_qdrant.upsert.assert_not_called()
+
+
+def test_worker_fails_direct_upload_whose_content_already_exists(pdf_file, stored_asset, fake_qdrant, make_asset):
+    import hashlib
+
+    make_asset(
+        id="6f1c1d1e-0000-4000-8000-000000000002",
+        filename="original.pdf",
+        sha256=hashlib.sha256(pdf_file.read_bytes()).hexdigest(),
+    )
+    stored_asset(pdf_file, filename="policy.pdf")  # direct upload sent without a hash
+    outcome = processor.ingest_asset.apply(args=[ASSET_ID])
+    assert outcome.failed()
+    with SessionLocal() as db:
+        assert "Duplicate content" in db.get(Asset, ASSET_ID).error
+    fake_qdrant.upsert.assert_not_called()

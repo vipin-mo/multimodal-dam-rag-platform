@@ -61,13 +61,13 @@ jobs:
           path: ~/.cache/huggingface
           key: hf-minilm-clip-whisper-tiny-v1
       - name: Start Qdrant, Postgres, MinIO
-        run: docker compose -f docker-compose.test.yml up -d --wait
+        run: docker compose -p dam-test -f docker-compose.test.yml up -d --wait
       - name: Integration tests
         run: |
           source scripts/integration-env.sh
           pytest -m integration -v
       - if: always()
-        run: docker compose -f docker-compose.test.yml down -v
+        run: docker compose -p dam-test -f docker-compose.test.yml down -v
 
   images:
     runs-on: ubuntu-latest

@@ -23,7 +23,12 @@ def live():
 
     with pytest.MonkeyPatch.context() as mp:
         # Run the Celery task in-process instead of dispatching to a broker.
-        mp.setattr(main, "enqueue_ingestion", lambda asset_id: processor.ingest_asset.apply(args=[asset_id]).id)
+        def run_inline(db, asset_id, username):
+            task_id = processor.ingest_asset.apply(args=[asset_id]).id
+            main.record_task(db, task_id, "ingest", asset_id, username)
+            return task_id
+
+        mp.setattr(main, "enqueue_ingestion", run_inline)
         with TestClient(main.app) as client:  # runs the lifespan: tables, bucket, collections
             res = client.post("/api/token", data={"username": "test_admin", "password": "admin-pass-123"})
             client.headers["Authorization"] = f"Bearer {res.json()['access_token']}"
@@ -131,3 +136,32 @@ def test_payload_indexes_exist(live):
     schema = vectors.qdrant.get_collection(vectors.TEXT).payload_schema
     assert {"asset_id", "media_type", "kind"} <= schema.keys()
     assert schema["asset_id"].data_type == qm.PayloadSchemaType.KEYWORD
+
+
+def test_postgres_enforces_one_active_copy_per_hash(live, assets):
+    """The partial unique index is Postgres-specific DDL; check it on the real database."""
+    import uuid
+
+    from sqlalchemy.exc import IntegrityError
+
+    from app.database import Asset, SessionLocal
+
+    original = assets["retention_policy.pdf"]
+    clone = {
+        "filename": "clone.pdf",
+        "media_type": "document",
+        "content_type": "application/pdf",
+        "sha256": original["sha256"],
+        "status": "ready",
+    }
+    with SessionLocal() as db:
+        db.add(Asset(id=str(uuid.uuid4()), object_key=f"x/{uuid.uuid4()}", **clone))
+        with pytest.raises(IntegrityError):
+            db.commit()
+        db.rollback()
+        # an explicitly allowed duplicate is accepted
+        allowed = Asset(id=str(uuid.uuid4()), object_key=f"x/{uuid.uuid4()}", duplicate_allowed=True, **clone)
+        db.add(allowed)
+        db.commit()
+        db.delete(allowed)
+        db.commit()

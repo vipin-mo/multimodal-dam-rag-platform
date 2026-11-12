@@ -223,6 +223,24 @@ def test_finalize_answer(raw, answer, cited):
     assert llm.finalize_answer(raw, n_sources=3) == (answer, cited)
 
 
+@pytest.mark.parametrize(
+    ("answer", "cited"),
+    [
+        ("Costs $52,000 [Source 2].", [2]),
+        ("See [Sources 1 and 3].", [1, 3]),
+        ("Both [1, 2] agree.", [1, 2]),
+        ("According to Source [2].", [2]),
+        ("Years [2026] are not citations, nor is [x].", []),
+    ],
+)
+def test_citation_formats_small_models_produce(answer, cited):
+    assert llm.cited_numbers(answer, n_sources=5) == cited
+
+
+def test_leading_citation_variants_are_stripped():
+    assert llm.finalize_answer("[Source 2] Due December 15.", 3) == ("Due December 15.", [2])
+
+
 def test_cited_numbers():
     assert llm.cited_numbers("A [2] and [1][3], not [9] or [x].", n_sources=3) == [1, 2, 3]
 

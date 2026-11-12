@@ -21,6 +21,7 @@ from itertools import islice
 from celery import Celery
 from celery.signals import worker_process_init
 from qdrant_client.http import models as qm
+from sqlalchemy.exc import IntegrityError
 
 from app import config, embeddings, llm, media, storage, summaries, vectors
 from app.chunking import chunk_text, window_segments
@@ -125,7 +126,10 @@ def ingest_asset(self, asset_id: str) -> dict:
         sha256 = file_sha256(local_path)
         if expected_sha and sha256 != expected_sha:
             raise ValueError("SHA-256 of the stored object does not match the hash sent at upload.")
-        update_asset(asset_id, sha256=sha256)
+        try:
+            update_asset(asset_id, sha256=sha256)
+        except IntegrityError:  # direct upload sent without a hash, and the content already exists
+            raise ValueError("Duplicate content: an identical asset is already in the library.") from None
 
         vectors.delete_asset(asset_id)  # idempotent re-indexing
         job = Job(asset_id, filename, media_type, local_path, report)

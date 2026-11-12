@@ -161,18 +161,23 @@ def build_rag_prompt(question: str, sources: list[dict]) -> str:
 NO_ANSWER = "I don't know: the retrieved sources don't answer this question."
 
 
+# A citation is a bracket holding source numbers, optionally prefixed: [2], [1, 3], [Source 2], [Sources 1 and 2].
+_CITATION = re.compile(r"\[\s*(?:sources?\s*)?(\d{1,2}(?:\s*(?:,|;|and|&)\s*\d{1,2})*)\s*\]", re.IGNORECASE)
+
+
 def finalize_answer(answer: str, n_sources: int) -> tuple[str, list[int]]:
     """Returns (answer, cited source numbers). Small models sometimes reply with only a citation
     such as "[1]" when the sources lack the answer; that is reported as no answer."""
-    text_only = re.sub(r"\[\d{1,2}\]", "", answer).strip(" .\n")
+    text_only = _CITATION.sub("", answer).strip(" .\n")
     if len(text_only) < 3 or text_only.lower().startswith("i don't know"):
         return NO_ANSWER, []
     cited = cited_numbers(answer, n_sources)
-    return re.sub(r"^(\s*\[\d{1,2}\])+\s*", "", answer), cited  # drop citations before any text
+    leading = re.compile(rf"^(\s*{_CITATION.pattern})+\s*", re.IGNORECASE)
+    return leading.sub("", answer), cited  # drop citations before any text
 
 
 def cited_numbers(answer: str, n_sources: int) -> list[int]:
-    found = {int(n) for n in re.findall(r"\[(\d{1,2})\]", answer)}
+    found = {int(n) for group in _CITATION.findall(answer) for n in re.findall(r"\d{1,2}", group)}
     return sorted(n for n in found if 1 <= n <= n_sources)
 
 

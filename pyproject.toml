@@ -1,6 +1,6 @@
 [project]
 name = "multimodal-dam"
-version = "2.0.0"
+version = "2.0.2"
 description = "Multimodal digital asset management with semantic search and RAG"
 requires-python = ">=3.11"
 

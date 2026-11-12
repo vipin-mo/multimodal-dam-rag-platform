@@ -20,7 +20,7 @@ from unittest.mock import MagicMock  # noqa: E402
 
 import pytest  # noqa: E402
 
-from app.database import Asset, Base, SessionLocal, User, engine, hash_password  # noqa: E402
+from app.database import Asset, Base, SessionLocal, Task, User, engine, hash_password  # noqa: E402
 
 PDF_BYTES = b"%PDF-1.4\n%fake test document\n"
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
@@ -49,6 +49,7 @@ def _schema():
 def _clean_assets():
     yield
     with SessionLocal() as db:
+        db.query(Task).delete()
         db.query(Asset).delete()
         db.commit()
 
@@ -112,7 +113,8 @@ def fake_models(monkeypatch):
 def fake_celery(monkeypatch):
     from app import main
 
-    send = MagicMock(name="send_task", return_value=SimpleNamespace(id="task-abc"))
+    ids = iter(["task-abc"] + [f"task-abc-{n}" for n in range(1, 100)])  # task ids are recorded, so unique
+    send = MagicMock(name="send_task", side_effect=lambda *a, **k: SimpleNamespace(id=next(ids)))
     monkeypatch.setattr(main.celery_client, "send_task", send)
     return send
 
