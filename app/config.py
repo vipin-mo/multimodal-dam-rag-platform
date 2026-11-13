@@ -37,6 +37,9 @@ MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio:9000")
 MINIO_PUBLIC_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", "http://localhost:9000")
 MINIO_BUCKET = os.getenv("MINIO_BUCKET", "dam-media")
 PRESIGNED_URL_TTL_SECONDS = _int("PRESIGNED_URL_TTL_SECONDS", 3600)
+# An upload still in progress after this long can't finish (its presigned URLs have expired), so it
+# stops holding its content hash and is marked failed the next time that hash is uploaded.
+STALE_UPLOAD_MINUTES = _int("STALE_UPLOAD_MINUTES", max(60, PRESIGNED_URL_TTL_SECONDS // 60))
 
 # Vector store
 QDRANT_HOST = os.getenv("QDRANT_HOST", "vector-db")

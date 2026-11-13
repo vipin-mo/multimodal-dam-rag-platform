@@ -1,3 +1,4 @@
+import hashlib
 import io
 
 import pytest
@@ -6,6 +7,13 @@ from fastapi.testclient import TestClient
 from app import main
 from app.database import Asset, SessionLocal
 from tests.conftest import PDF_BYTES, PNG_BYTES
+
+
+def _hash() -> str:
+    """A fresh, valid SHA-256 hex string for direct-upload requests that don't care about content."""
+    import uuid
+
+    return hashlib.sha256(uuid.uuid4().bytes).hexdigest()
 
 
 def _upload(client, headers, name: str, data: bytes):
@@ -67,7 +75,11 @@ def test_upload_rejected_while_streaming_when_over_limit(client, admin_headers, 
 # ---------------------------------------------------------------- direct (presigned) uploads
 def test_direct_upload_init_returns_one_presigned_url_per_part(client, admin_headers):
     size = 40 * 2**20  # 40 MiB with 16 MiB parts -> 3 parts
-    res = client.post("/api/uploads/init", headers=admin_headers, json={"filename": "video.mp4", "size_bytes": size})
+    res = client.post(
+        "/api/uploads/init",
+        headers=admin_headers,
+        json={"filename": "video.mp4", "size_bytes": size, "sha256": _hash()},
+    )
     assert res.status_code == 201, res.text
     body = res.json()
     assert body["part_size"] == 16 * 2**20
@@ -80,14 +92,20 @@ def test_direct_upload_init_returns_one_presigned_url_per_part(client, admin_hea
 
 def test_direct_upload_rejects_oversized_and_unknown_types(client, admin_headers):
     too_big = (main.MAX_DIRECT_UPLOAD_BYTES or 0) + 1
-    res = client.post("/api/uploads/init", headers=admin_headers, json={"filename": "v.mp4", "size_bytes": too_big})
+    res = client.post(
+        "/api/uploads/init", headers=admin_headers, json={"filename": "v.mp4", "size_bytes": too_big, "sha256": _hash()}
+    )
     assert res.status_code == 413
-    res = client.post("/api/uploads/init", headers=admin_headers, json={"filename": "v.iso", "size_bytes": 10})
+    res = client.post(
+        "/api/uploads/init", headers=admin_headers, json={"filename": "v.iso", "size_bytes": 10, "sha256": _hash()}
+    )
     assert res.status_code == 415
 
 
 def _init(client, headers, size=1000):
-    return client.post("/api/uploads/init", headers=headers, json={"filename": "clip.mp4", "size_bytes": size}).json()
+    return client.post(
+        "/api/uploads/init", headers=headers, json={"filename": "clip.mp4", "size_bytes": size, "sha256": _hash()}
+    ).json()
 
 
 def test_direct_upload_complete_verifies_size_then_queues(client, admin_headers, fake_s3, fake_celery):
@@ -245,3 +263,51 @@ def test_reindex_refuses_to_revive_a_failed_copy_of_active_content(client, admin
     assert res.status_code == 409
     with SessionLocal() as db:
         assert db.get(Asset, failed.id).status == "failed"
+
+
+# ---------------------------------------------------------------- abandoned uploads
+def _age(asset_id: str, minutes: int) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    with SessionLocal() as db:
+        db.get(Asset, asset_id).updated_at = datetime.now(UTC) - timedelta(minutes=minutes)
+        db.commit()
+
+
+def test_direct_upload_requires_a_hash(client, admin_headers):
+    res = client.post("/api/uploads/init", headers=admin_headers, json={"filename": "v.mp4", "size_bytes": 10})
+    assert res.status_code == 422
+
+
+def test_live_upload_of_same_content_says_in_progress(client, admin_headers):
+    sha = _hash()
+    body = {"filename": "big.mp4", "size_bytes": 1000, "sha256": sha}
+    assert client.post("/api/uploads/init", headers=admin_headers, json=body).status_code == 201
+    res = client.post("/api/uploads/init", headers=admin_headers, json=body)
+    assert res.status_code == 409
+    assert "being uploaded right now" in res.json()["detail"]
+
+
+def test_abandoned_direct_upload_releases_its_hash(client, admin_headers, fake_s3):
+    from app import config
+
+    sha = _hash()
+    body = {"filename": "big.mp4", "size_bytes": 1000, "sha256": sha}
+    first = client.post("/api/uploads/init", headers=admin_headers, json=body).json()
+    _age(first["asset_id"], config.STALE_UPLOAD_MINUTES + 1)  # its presigned URLs have expired
+
+    retry = client.post("/api/uploads/init", headers=admin_headers, json=body)
+    assert retry.status_code == 201
+    fake_s3.abort_multipart_upload.assert_called_once()  # the abandoned multipart upload is cleaned up
+    with SessionLocal() as db:
+        old = db.get(Asset, first["asset_id"])
+        assert old.status == "failed" and "abandoned" in old.error
+
+
+def test_abandoned_api_upload_releases_its_hash(client, admin_headers, make_asset, fake_s3):
+    from app import config
+
+    stuck = make_asset(status="uploading", sha256=hashlib.sha256(PDF_BYTES).hexdigest())
+    _age(stuck.id, config.STALE_UPLOAD_MINUTES + 1)  # e.g. the API process died mid-upload
+    assert _upload(client, admin_headers, "report.pdf", PDF_BYTES).status_code == 202
+    fake_s3.delete_object.assert_called_once_with(Bucket="dam-media", Key=stuck.object_key)

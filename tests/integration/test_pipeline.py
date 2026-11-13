@@ -100,7 +100,12 @@ def test_rag_cites_retrieved_page(live, assets, monkeypatch):
 
 def test_direct_presigned_upload_roundtrip(live):
     data = (CORPUS / "incident_postmortem.pdf").read_bytes()
-    plan = live.post("/api/uploads/init", json={"filename": "postmortem.pdf", "size_bytes": len(data)}).json()
+    import hashlib
+
+    plan = live.post(
+        "/api/uploads/init",
+        json={"filename": "postmortem.pdf", "size_bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()},
+    ).json()
     assert len(plan["parts"]) == 1
     put = httpx.put(plan["parts"][0]["url"], content=data)  # straight to MinIO, not via the API
     put.raise_for_status()

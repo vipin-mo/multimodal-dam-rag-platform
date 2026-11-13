@@ -403,7 +403,7 @@ def main() -> None:
     p = sub.add_parser("summary", help="time a fresh summary of one ingested asset (admin)")
     p.add_argument("--file", required=True, help="filename of a ready asset")
 
-    p = sub.add_parser("images", help="record local Docker image sizes (no API needed)")
+    p = sub.add_parser("images", help="record local Docker image sizes; pass --api legacy for v1 images")
     p.add_argument("tags", nargs="+")
 
     args = parser.parse_args()

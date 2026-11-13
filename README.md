@@ -36,9 +36,10 @@ runs on one laptop. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for ranges, met
   security (secrets, auth, upload validation), reliability (background LLM worker, retry policy),
   a real test suite with CI, and new features: an asset catalog, direct large uploads, image
   captions, cited answers and deduplication.
-- **v2.0.1 – v2.0.2 (Oct – Nov 2026):** fixes from two written reviews by a separate AI reviewer: admin-only summary
-  refresh, a database-enforced duplicate check, per-user task visibility, a scored answer-quality
-  eval, five-run benchmarks, and corrected wording wherever a claim overstated the code.
+- **v2.0.1 – v2.0.3 (Oct – Nov 2026):** fixes from several rounds of written review by a separate
+  AI reviewer: admin-only summary refresh, a database-enforced duplicate check, per-user task
+  visibility, release of abandoned uploads, a scored answer-quality eval, a citation-prompt A/B,
+  five-run benchmarks, and corrected wording wherever a claim overstated the code.
 
 To reproduce the comparison, check out each tag and run `scripts/benchmark.py`; v1 needs `--api legacy`.
 
@@ -68,8 +69,8 @@ To reproduce the comparison, check out each tag and run `scripts/benchmark.py`; 
   supports delete (object, vectors and catalog row) and re-index.
 - **Duplicate detection.** Every file is identified by its SHA-256. Uploading content that is
   already in the library returns `409` with the existing asset, unless `allow_duplicate=true`.
-  The direct uploader sends the hash first, so a duplicate is rejected before any bytes are sent,
-  and the worker re-hashes the stored object as an integrity check.
+  Direct uploads must send the hash at `init`, so a duplicate is rejected before any bytes are
+  sent, and the worker re-hashes the stored object as an integrity check.
 - **Large files.** Presigned multipart uploads go straight to object storage
   (`scripts/dam_upload.py`). Memory stays bounded by the part size whatever the file size.
 - **Monitoring (optional).** Prometheus and a provisioned Grafana dashboard show request rate, p95
@@ -204,7 +205,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 | `POST /api/token` | – | OAuth2 password form; returns a JWT |
 | `GET /api/me` | any | Current user |
 | `POST /api/upload` | admin | Multipart upload (≤ `MAX_UPLOAD_MB`); `202` with asset ID and task ID, `409` if the content is already stored |
-| `POST /api/uploads/init` · `/{id}/complete` · `/{id}/abort` | admin | Presigned direct-upload lifecycle |
+| `POST /api/uploads/init` · `/{id}/complete` · `/{id}/abort` | admin | Presigned direct-upload lifecycle; `init` requires the file's `sha256` |
 | `GET /api/assets` · `/{id}` · `/{id}/url` | any | Catalog list (with filters), detail, presigned media URL |
 | `DELETE /api/assets/{id}` · `POST /api/assets/{id}/reindex` | admin | Remove everything for the asset / re-run ingestion |
 | `GET /api/search?query=&media_type=&asset_id=&limit=` | any | Text and visual search in one call |
@@ -231,7 +232,11 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
   object's SHA-256 against the hash recorded at upload.
 - **Duplicates.** A partial unique index in Postgres allows only one active asset per SHA-256
   (unless a duplicate was explicitly allowed), so two identical uploads racing each other can't
-  both get in. The catalog row is claimed before any bytes are stored.
+  both get in. The catalog row is claimed before any bytes are stored. Direct uploads must send the
+  hash at `init`, so a duplicate is rejected before any bytes reach storage. An upload that never
+  completes stops holding its hash once its presigned URLs expire (`STALE_UPLOAD_MINUTES`, default
+  60): the next upload of the same content marks it failed and cleans up its partial data. Media
+  URLs aren't issued until an upload has finished.
 - **Tasks.** Every Celery task is recorded with the user who started it. Users can poll only their
   own tasks; admins can poll any. Another user's task returns the same `404` as a task that
   doesn't exist.
@@ -249,7 +254,7 @@ http://localhost:3000 (user `admin`, password from `GRAFANA_ADMIN_PASSWORD`) and
 pip install --index-url https://download.pytorch.org/whl/cpu torch==2.14.0
 pip install -r requirements/dev.txt
 ruff check . && ruff format --check .
-pytest --cov                          # 148 unit tests, no network, ~15 s
+pytest --cov                          # 154 unit tests, no network, ~15 s
 ./scripts/run-integration-tests.sh    # 10 integration tests against real Qdrant, Postgres and MinIO
 ```
 
@@ -260,7 +265,8 @@ pytest --cov                          # 148 unit tests, no network, ~15 s
   - path-traversal filenames, content sniffing and size limits
   - whitespace, control-character and injection-style queries
   - citation parsing (including `[Source 2]` and `[1, 3]` forms), LLM retry policy and map-reduce
-  - the duplicate race (a duplicate that slips past the check is still rejected) and task ownership
+  - the duplicate race (a duplicate that slips past the check is still rejected), abandoned uploads
+    releasing their hash, and task ownership
   - the worker pipelines, using real pypdf, OpenCV and Pillow on generated files
 - **Integration tests** use the real MiniLM, CLIP and Whisper models and real services. They
   check ingestion, text-to-image search, transcript timestamps, idempotent re-indexing, delete,
@@ -328,8 +334,8 @@ timestamps.
   duplicate assets doubling every search result, one video scene filling all the visual results,
   the summary progress total jumping, and a stale player after a new search. All four are fixed;
   the three on the API side also have tests.
-- **Reviews.** Two written reviews by a separate AI reviewer checked the code against the README
-  and my resume. Every finding was either fixed or listed under Limitations.
+- **Reviews.** Several rounds of written review by a separate AI reviewer checked the code against
+  the README and my resume. Every finding was either fixed or listed under Limitations.
 - **Verification.** Every number in the results table comes from `scripts/benchmark.py`, with raw
   results committed in `benchmarks/results.jsonl` and tags `v1.0` / `v2.0` to reproduce both sides.
 

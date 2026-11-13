@@ -212,7 +212,7 @@ Every record in `results.jsonl`, grouped by label. Line numbers are 1-based.
 | `v2-final`, `v2-final-with-distractors` | 25–27, 29 | Re-check on the final October build | Not used (same as lines 17/20) |
 | *(no label)* | 30–31 | Run during my manual UI testing on Oct 16. `retention_policy.pdf` wasn't in the index at the time (most likely removed in the delete scenario): all three misses are questions about that file, and none of its chunks appear in their top results. Its 31.6 req/s is within the normal range. | Excluded |
 | `v2.1-dedup`, `v2.1-with-distractors`, `v2.1-dedup-c1-rerun1/2` | 32–33, 35–37 | Re-check after the dedup change | Not used (same retrieval; latency inside the ranges above) |
-| `v1-images`, `v2-images` | 38–39 | Image sizes | Images table |
+| `v1-images`, `v2-images` | 38–39 | Image sizes. Line 38 was first written with `"api": "v2"` because the `images` command took the default flag; corrected to `"legacy"` on Nov 12. | Images table |
 | `v2-summary` | 40–41 | Summary timings | Summaries table |
 | `v2.0.2-answers` | 43 | First answer eval, before the citation-parser fix | Excluded (see Answer quality) |
 | `v2.0.2-answers-run1/2/3` | 44–46 | Answer eval | Answer quality table |

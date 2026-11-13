@@ -25,6 +25,13 @@ def test_asset_detail_404_for_unknown_or_malformed_ids(client, viewer_headers):
     assert client.get("/api/assets/00000000-0000-0000-0000-000000000000", headers=viewer_headers).status_code == 404
 
 
+@pytest.mark.parametrize("state", ["uploading", "pending_upload"])
+def test_no_media_url_until_the_upload_is_complete(client, viewer_headers, make_asset, fake_s3, state):
+    asset = make_asset(status=state)
+    assert client.get(f"/api/assets/{asset.id}/url", headers=viewer_headers).status_code == 409
+    fake_s3.generate_presigned_url.assert_not_called()
+
+
 def test_presigned_url_uses_public_endpoint(client, viewer_headers, make_asset, fake_s3):
     asset = make_asset()
     body = client.get(f"/api/assets/{asset.id}/url", headers=viewer_headers).json()

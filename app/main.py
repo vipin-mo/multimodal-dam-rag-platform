@@ -1,11 +1,13 @@
 """API gateway: auth, uploads, asset catalog, search, RAG and summaries."""
 
 import asyncio
+import contextlib
 import hashlib
 import logging
 import re
 import uuid
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 import httpx
@@ -53,7 +55,7 @@ async def lifespan(_: FastAPI):
     warmup.cancel()
 
 
-app = FastAPI(title="Multimodal DAM Gateway", version="2.0.2", lifespan=lifespan)
+app = FastAPI(title="Multimodal DAM Gateway", version="2.0.3", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
@@ -180,24 +182,62 @@ def hash_upload(fileobj, limit: int) -> tuple[str, int]:
     return digest.hexdigest(), size
 
 
+IN_PROGRESS = ("uploading", "pending_upload")
+
+
 def claim_asset_row(db: Session, asset: Asset) -> None:
     """Inserts the catalog row before any bytes are stored. The partial unique index on sha256 makes
     the database the final arbiter: if an identical upload won a race past reject_duplicate(), this
     insert fails and the request gets the same 409."""
-    db.add(asset)
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        if asset.sha256:
+    for attempt in (1, 2):
+        db.add(asset)
+        try:
+            db.commit()
+            return
+        except IntegrityError:
+            db.rollback()
+            if not asset.sha256 or attempt == 2:
+                break
+            # Raises 409 for a live copy; if the clash was an abandoned upload it is released, so retry.
             reject_duplicate(db, asset.sha256)
-        raise HTTPException(status_code=409, detail="This content is already being uploaded.")
+    raise HTTPException(status_code=409, detail="This content is already being uploaded.")
+
+
+def release_abandoned_uploads(db: Session, sha256: str) -> None:
+    """Marks in-progress uploads of this content as failed once they are older than
+    STALE_UPLOAD_MINUTES: their presigned URLs have expired, so they can never complete, and
+    otherwise they would hold the hash forever. Partial data in storage is cleaned up."""
+    cutoff = datetime.now(UTC) - timedelta(minutes=config.STALE_UPLOAD_MINUTES)
+    released = False
+    for row in db.query(Asset).filter(Asset.sha256 == sha256, Asset.status.in_(IN_PROGRESS)):
+        updated = row.updated_at if row.updated_at.tzinfo else row.updated_at.replace(tzinfo=UTC)
+        if updated >= cutoff:
+            continue
+        upload_id = (row.stats or {}).get("upload_id")
+        with contextlib.suppress(Exception):  # best effort: the row is released either way
+            if upload_id:
+                storage.abort_multipart(row.object_key, upload_id)
+            else:
+                storage.delete_object(row.object_key)
+        row.status, row.error = "failed", "Upload abandoned: it never completed."
+        released = True
+    if released:
+        db.commit()
 
 
 def reject_duplicate(db: Session, sha256: str) -> None:
+    release_abandoned_uploads(db, sha256)
     existing = (
         db.query(Asset).filter(Asset.sha256 == sha256, Asset.status != "failed").order_by(Asset.created_at).first()
     )
+    if existing and existing.status in IN_PROGRESS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This content is being uploaded right now (asset {existing.id}). Try again once it "
+                f"finishes; an upload that never completes is released after {config.STALE_UPLOAD_MINUTES} minutes."
+            ),
+        )
     if existing:
         raise HTTPException(
             status_code=409,
@@ -348,9 +388,9 @@ def upload_asset(
 class DirectUploadInit(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     size_bytes: int = Field(gt=0)
-    # Optional: lets the server reject a duplicate before any bytes are sent. The worker re-hashes
-    # the stored object and fails the asset if it doesn't match.
-    sha256: str | None = Field(None, pattern="^[0-9a-f]{64}$")
+    # Required, so a duplicate is rejected before any bytes are sent. The worker re-hashes the
+    # stored object and fails the asset if it doesn't match.
+    sha256: str = Field(pattern="^[0-9a-f]{64}$")
     allow_duplicate: bool = False
 
 
@@ -379,7 +419,7 @@ def init_direct_upload(req: DirectUploadInit, user: User = Depends(require_admin
         raise HTTPException(status_code=415, detail=str(exc))
     if req.size_bytes > MAX_DIRECT_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"File exceeds {config.MAX_DIRECT_UPLOAD_MB} MB.")
-    if req.sha256 and not req.allow_duplicate:
+    if not req.allow_duplicate:
         reject_duplicate(db, req.sha256)
 
     asset_id = str(uuid.uuid4())
@@ -489,7 +529,7 @@ def asset_detail(_: User = Depends(require_user), asset: Asset = Depends(get_ass
 @app.get("/api/assets/{asset_id}/url")
 def asset_url(_: User = Depends(require_user), asset: Asset = Depends(get_asset)):
     """Short-lived presigned URL so browsers stream media straight from object storage."""
-    if asset.status == "pending_upload":
+    if asset.status in IN_PROGRESS:  # the object isn't fully stored yet
         raise HTTPException(status_code=409, detail="Upload has not completed.")
     url = storage.presigned_get(asset.object_key, asset.content_type, asset.filename)
     return {"asset_id": asset.id, "url": url, "expires_in": config.PRESIGNED_URL_TTL_SECONDS}
